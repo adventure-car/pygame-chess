@@ -1290,7 +1290,66 @@ def draw_legend(s, x, y):
     return y + 8
 
 
-class Game2P(AnimMixin, ChoiceMixin):
+class PlanMixin:
+    """Planning marks: right-click a square to highlight it, right-drag between squares to draw an arrow.
+    Any left click clears them.  They are only on your screen."""
+    ARROW_COL = (60, 170, 70, 175)
+    MARK_COL = (230, 80, 60, 130)
+    arrows = frozenset()
+    marks = frozenset()
+    rdrag = None
+
+    def plan_down(self, pos):
+        self.rdrag = self.pos_to_sq(pos)
+
+    def plan_up(self, pos):
+        a, b = self.rdrag, self.pos_to_sq(pos)
+        self.rdrag = None
+        if a is None or b is None:
+            return
+        if a == b:
+            self.marks = self.marks ^ {a}
+        else:
+            self.arrows = self.arrows ^ {(a, b)}
+
+    def plan_clear(self):
+        self.arrows, self.marks, self.rdrag = frozenset(), frozenset(), None
+
+    def draw_marks(self, s):
+        if not self.marks:
+            return
+        tint = pygame.Surface((self.cell, self.cell), pygame.SRCALPHA)
+        tint.fill(self.MARK_COL)
+        for i in self.marks:
+            s.blit(tint, self.sq_to_xy(i))
+
+    def draw_arrows(self, s):
+        arrows = set(self.arrows)
+        if self.rdrag is not None:                       # live preview while dragging
+            cur = self.pos_to_sq(pygame.mouse.get_pos())
+            if cur is not None and cur != self.rdrag:
+                arrows.add((self.rdrag, cur))
+        if not arrows:
+            return
+        layer = pygame.Surface((W, H), pygame.SRCALPHA)
+        width = max(4, int(self.cell * 0.2))
+        head = max(10, int(self.cell * 0.45))
+        for a, b in arrows:
+            (x1, y1), (x2, y2) = self.center(a), self.center(b)
+            dx, dy = x2 - x1, y2 - y1
+            d = max(1.0, (dx * dx + dy * dy) ** 0.5)
+            ux, uy = dx / d, dy / d
+            bx, by = x2 - ux * head, y2 - uy * head          # where the arrow head starts
+            sx, sy = x1 + ux * self.cell * 0.25, y1 + uy * self.cell * 0.25
+            px, py = -uy, ux
+            hw, hh = width / 2, head * 0.55
+            pygame.draw.polygon(layer, self.ARROW_COL, [
+                (sx + px * hw, sy + py * hw), (bx + px * hw, by + py * hw), (bx + px * hh, by + py * hh),
+                (x2, y2), (bx - px * hh, by - py * hh), (bx - px * hw, by - py * hw), (sx - px * hw, sy - py * hw)])
+        s.blit(layer, (0, 0))
+
+
+class Game2P(AnimMixin, ChoiceMixin, PlanMixin):
     def __init__(self, glyphs, variant, elo, side):
         self.g = glyphs
         self.variant, self.elo = variant, elo
@@ -1554,6 +1613,7 @@ class Game2P(AnimMixin, ChoiceMixin):
                 pygame.draw.rect(s, (220, 60, 50), (x, y, cell, cell), 4)
             if i == self.sel:
                 pygame.draw.rect(s, (250, 230, 90), (x, y, cell, cell), 4)
+        self.draw_marks(s)
         for i, p in enumerate(b.sq):
             if p and i not in hidden:
                 img = self.piece_img(p)
@@ -1561,6 +1621,7 @@ class Game2P(AnimMixin, ChoiceMixin):
         draw_cooldowns(s, b.cd, self.center, cell, hidden)
         qsq = {self.sel} if (self.army and self.sel is not None and abs(b.sq[self.sel]) == QUEEN) else frozenset()
         draw_markers(s, self.sel_moves, self.center, cell, lambda t: b.sq[t] != 0, qsq, 100)
+        self.draw_arrows(s)
         for c in range(b.cols):
             col = c if not self.flip else b.cols - 1 - c
             text(s, chr(97 + col), 18, (self.ox + c * cell + cell - 12, self.oy + b.rows * cell - 16), (60, 50, 40))
@@ -1576,6 +1637,10 @@ class Game2P(AnimMixin, ChoiceMixin):
     # panel text (overridden by the LAN game)
     HINT = "Restart for a rematch, or go back to the menu"
     opp_label = "Bot"
+    me_label = "You"
+
+    def side_text(self):
+        return "You play " + ("White" if self.human == 1 else "Black")
 
     def subtitle(self):
         return "Bot - Elo %d" % self.elo
@@ -1595,9 +1660,9 @@ class Game2P(AnimMixin, ChoiceMixin):
         opp, me = -self.human, self.human
         if self.blitz:
             text(s, self.opp_label + " " + fmt_clock(self.clock[opp]), 34, (px, 100), TEXT if self.board.turn == opp else MUTED)
-            text(s, "You " + fmt_clock(self.clock[me]), 34, (px, 135), TEXT if self.board.turn == me else MUTED)
+            text(s, self.me_label + " " + fmt_clock(self.clock[me]), 34, (px, 135), TEXT if self.board.turn == me else MUTED)
         text(s, self.status_text(), 28, (px, 185), ACCENT)
-        text(s, "You play " + ("White" if self.human == 1 else "Black"), 22, (px, 215), MUTED)
+        text(s, self.side_text(), 22, (px, 215), MUTED)
         y = 245
         if self.army:
             y = draw_legend(s, px, y)
@@ -1630,7 +1695,7 @@ class Game2P(AnimMixin, ChoiceMixin):
         return label
 
 
-class Game4P(AnimMixin, ChoiceMixin):
+class Game4P(AnimMixin, ChoiceMixin, PlanMixin):
     rot = 0
     HINT = "Restart for a rematch, or go back to the menu"          # quarter turns the view is rotated so the local player's pieces sit at the bottom
 
@@ -1830,6 +1895,8 @@ class Game4P(AnimMixin, ChoiceMixin):
             else:
                 a_wins = None if a == c else a > c
             mine = self.human % 2
+            self.result_neutral = "Draw - teams tied on %d" % a if a_wins is None else \
+                ("Red & Yellow win! (%d - %d)" % (a, c) if a_wins else "Blue & Green win! (%d - %d)" % (c, a))
             if a_wins is None:
                 self.result = "Draw - teams tied on %d" % a
             elif a_wins == (mine == 0):
@@ -1842,6 +1909,7 @@ class Game4P(AnimMixin, ChoiceMixin):
         winners = [PLAYER_NAMES[i] for i in range(4) if b.score[i] == top]
         self.result = ("%s wins with %d points!" % (winners[0], top)) if len(winners) == 1 \
             else "Draw - %s tied on %d" % (" & ".join(winners), top)
+        self.result_neutral = self.result
         self.legal = []
 
     def resign(self):
@@ -1915,6 +1983,7 @@ class Game4P(AnimMixin, ChoiceMixin):
             if b.alive[p] and b.in_check(p):
                 x, y = self.sq_to_xy(b.kings[p])
                 pygame.draw.rect(s, (230, 40, 40), (x, y, cell, cell), 4)
+        self.draw_marks(s)
         for i, pc in enumerate(b.sq):
             if pc and i not in hidden:
                 img = self.piece_img(pc)
@@ -1922,6 +1991,7 @@ class Game4P(AnimMixin, ChoiceMixin):
         draw_cooldowns(s, b.cd, self.center, cell, hidden)
         qsq = {self.sel} if (self.army and self.sel is not None and b.sq[self.sel][1] == QUEEN) else frozenset()
         draw_markers(s, self.sel_moves, self.center, cell, lambda t: b.sq[t] is not None, qsq, 1000)
+        self.draw_arrows(s)
         self.draw_anim(s)
         if self.banner and time.time() < self.banner[1]:
             box = pygame.Surface((520, 44), pygame.SRCALPHA)
@@ -2219,6 +2289,8 @@ class ChatMixin:
     CHAT_TOP_PAD = 36
     INPUT_Y = 604
 
+    chat_readonly = False
+
     def chat_init(self):
         self.chat = []                # (who or None, text, color, team)
         self.chat_text = ""
@@ -2264,6 +2336,7 @@ class ChatMixin:
         if not self.chat_focus:
             if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self.open_chat()
+                self.chat_focus = not self.chat_readonly
                 return True
             return False
         if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
@@ -2298,7 +2371,7 @@ class ChatMixin:
             self.chat_focus = True
             return True
         if self.tab == "chat" and box.collidepoint(pos):
-            self.chat_focus = True
+            self.chat_focus = not self.chat_readonly
             return True
         self.chat_focus = False
         return False
@@ -2345,11 +2418,83 @@ class ChatMixin:
             caret = "|" if self.chat_focus and int(time.time() * 2) % 2 else ""
             text(s, shown + caret, size, (box.x + 7, box.y + 10))
         else:
-            text(s, "Enter to chat" + (" (Tab: team)" if chan and box.w > 200 else ""), size,
+            text(s, "Spectating - read only" if self.chat_readonly else
+                 "Enter to chat" + (" (Tab: team)" if chan and box.w > 200 else ""), size,
                  (box.x + 7, box.y + 10), (110, 106, 100))
 
 
-class NetGame2P(ChatMixin, Game2P):
+class SpecHostMixin:
+    """Lets friends watch a LAN game through this player: they get a snapshot of every move so far, then each
+    move as it is played, plus the public chat (never team chat).  Watchers can't affect the game."""
+    MAX_SPECS = 8
+    specs = ()
+
+    def spec_init(self):
+        self.specs = []               # [(Peer, name)]
+        self.spec_result_sent = False
+
+    def spec_info(self):
+        raise NotImplementedError
+
+    def spec_log(self):
+        raise NotImplementedError
+
+    def neutral_result(self):
+        return self.result
+
+    def add_spectator(self, peer, name, quiet=False):
+        peer.send({"type": "spec_start", "info": self.spec_info(), "events": self.spec_log(),
+                   "result": self.neutral_result() if self.result else None})
+        self.specs.append((peer, name))
+        if not quiet:
+            self.chat_add(None, "%s is watching" % name, MUTED)
+
+    def adopt_spectators(self, old):
+        for peer, name in old.specs:
+            if peer.alive:
+                self.add_spectator(peer, name, quiet=True)
+        old.specs = []
+
+    def spec_send(self, msg):
+        for peer, _ in self.specs:
+            peer.send(msg)
+
+    def spec_ev(self, ev):
+        if not getattr(self, "replaying", False):
+            self.spec_send({"type": "spec", "ev": ev})
+
+    def chat_add(self, who, msg, color, team=False):
+        super().chat_add(who, msg, color, team)
+        if self.specs and not team:
+            self.spec_send({"type": "spec_chat", "who": my_name() if who == "You" else who, "text": msg,
+                            "color": list(color)})
+
+    def spec_pump(self):
+        for item in list(self.specs):
+            peer, name = item
+            while True:
+                m = peer.get()
+                if m is None:
+                    break
+                if m.get("type") == "_closed":
+                    self.specs.remove(item)
+                    self.chat_add(None, "%s stopped watching" % name, MUTED)
+                    break
+        if self.result and not self.spec_result_sent:
+            self.spec_result_sent = True
+            self.spec_ev(["end", self.neutral_result()])
+
+    def spec_close(self):
+        for peer, _ in self.specs:
+            peer.send({"type": "spec_end", "text": "The player you were watching through left the game"})
+            peer.close()
+        self.specs = []
+
+    def watching_note(self):
+        return "  - %d watching" % len(self.specs) if self.specs else ""
+
+
+class NetGame2P(SpecHostMixin, ChatMixin, Game2P):
     """Two humans on different machines.  Both sides run the same deterministic board and swap moves."""
     HINT = "Rematch to play again with colors swapped, or go back"
     FLAG_GRACE = 5.0      # seconds we wait for the opponent's own client to report their time loss
@@ -2358,6 +2503,8 @@ class NetGame2P(ChatMixin, Game2P):
         super().__init__(glyphs, variant, ELOS[0], side)
         self.peer, self.opp_name, self.back_to = peer, opp_name, back_to
         self.chat_init()
+        self.spec_init()
+        self.spec_events = []
         self.opp_label = "Opp"
         self.title += " (LAN)"
         self.rematch_me = self.rematch_them = False
@@ -2365,7 +2512,26 @@ class NetGame2P(ChatMixin, Game2P):
         self.flag_since = None
 
     def subtitle(self):
-        return "vs %s (%s)" % (self.opp_name[:16], self.peer.addr)
+        return "vs %s (%s)%s" % (self.opp_name[:12], self.peer.addr, self.watching_note())
+
+    # spectators
+    def spec_info(self):
+        names = {self.human: my_name(), -self.human: self.opp_name}
+        return {"kind": 2, "variant": self.variant, "white": names[1], "black": names[-1],
+                "clock": {"1": round(self.clock[1], 2), "-1": round(self.clock[-1], 2)}}
+
+    def spec_log(self):
+        return self.spec_events
+
+    def neutral_result(self):
+        r, me = self.result, self.human
+        if r == "You resigned":
+            return "%s resigned - %s wins!" % (self.color(me), self.color(-me))
+        if r == "Opponent resigned - you win!":
+            return "%s resigned - %s wins!" % (self.color(-me), self.color(me))
+        if r == "Opponent disconnected":
+            return "%s disconnected" % self.color(-me)
+        return r
 
     def status_text(self):
         if self.result:
@@ -2384,6 +2550,9 @@ class NetGame2P(ChatMixin, Game2P):
     def play(self, m):
         local = self.board.turn == self.human
         super().play(m)
+        ev = ["m", list(m), {"1": round(self.clock[1], 2), "-1": round(self.clock[-1], 2)}]
+        self.spec_events.append(ev)
+        self.spec_ev(ev)
         if local:
             self.peer.send({"type": "move", "m": list(m), "clock": round(self.clock[self.human], 2)})
 
@@ -2402,6 +2571,8 @@ class NetGame2P(ChatMixin, Game2P):
     def close(self):
         """Leaving the game: resign if it is still running, then hang up."""
         self.resign()
+        self.spec_pump()                      # lets watchers see the resignation
+        self.spec_close()
         self.peer.close()
 
     def handle(self, msg):
@@ -2442,6 +2613,7 @@ class NetGame2P(ChatMixin, Game2P):
     def update(self):
         now = time.time()
         dt, self.tick = now - self.tick, now
+        self.spec_pump()
         while True:
             if self.rematch_me and self.rematch_them and self.peer.alive:
                 if self.next_game is None:
@@ -2480,7 +2652,7 @@ class NetGame2P(ChatMixin, Game2P):
         return super().press(label)
 
 
-class NetGame4P(ChatMixin, Game4P):
+class NetGame4P(SpecHostMixin, ChatMixin, Game4P):
     """4 Player over the LAN.  The player who sent the challenges is the hub (any seat): it runs the bots,
     checks every move and relays it to everyone else, so all boards apply the same moves in the same order.
     Resignations take effect on the resigning player's own turn, so they can never race another move."""
@@ -2504,6 +2676,7 @@ class NetGame4P(ChatMixin, Game4P):
         self.title += " (LAN)"
         self.chat_init()
         self.events = []                      # every move / resignation in order (used to re-sync a player)
+        self.spec_init()
         self.replaying = False
         self.resync_wait = False
 
@@ -2533,8 +2706,18 @@ class NetGame4P(ChatMixin, Game4P):
     # labels
     def subtitle(self):
         humans = sum(1 for n in self.names if n is not None)
-        return "LAN - %d human%s%s" % (humans, "s" if humans != 1 else "",
-                                       (", bots Elo ~%d" % self.elo) if humans < 4 else "")
+        return "LAN - %d human%s%s%s" % (humans, "s" if humans != 1 else "",
+                                         (", bots ~%d" % self.elo) if humans < 4 else "", self.watching_note())
+
+    # spectators
+    def spec_info(self):
+        return {"kind": 4, "variant": self.variant, "teams": self.teams, "names": self.names, "elo": self.elo}
+
+    def spec_log(self):
+        return self.events
+
+    def neutral_result(self):
+        return getattr(self, "result_neutral", None) or self.result
 
     def player_name(self, p):
         if p == self.human:
@@ -2556,6 +2739,7 @@ class NetGame4P(ChatMixin, Game4P):
         super().play(m)
         if self.replaying:
             return
+        self.spec_ev(["m", mover, list(m)])
         if self.is_hub:
             self.broadcast({"type": "move", "p": mover, "m": list(m)}, skip=mover)
         elif mover == self.human:
@@ -2564,7 +2748,8 @@ class NetGame4P(ChatMixin, Game4P):
     def resign_seat(self, p):
         if not self.result and self.b.alive[p]:
             self.events.append(["r", p])
-        super().resign_seat(p)
+            super().resign_seat(p)
+            self.spec_ev(["r", p])
 
     def legal_ok(self, mv):
         return move_ok(mv, self.legal, PROMO4, 1)
@@ -2611,6 +2796,7 @@ class NetGame4P(ChatMixin, Game4P):
             self.host.send({"type": "resign"})
 
     def close(self):
+        self.spec_close()
         if self.is_hub:
             for pr in self.peers.values():
                 pr.close()
@@ -2620,6 +2806,7 @@ class NetGame4P(ChatMixin, Game4P):
 
     def update(self):
         self.animating()
+        self.spec_pump()
         if self.is_hub:
             self.update_hub()
         else:
@@ -2754,6 +2941,201 @@ class NetGame4P(ChatMixin, Game4P):
         return super().press(label)
 
 
+class SpecViewMixin:
+    """A read-only game fed by a player's spectator stream."""
+    HINT = "You're spectating - go back to leave"
+    back_to = "lan"
+    chat_readonly = True
+
+    def spec_view_init(self, peer):
+        self.peer = peer
+        self.squeue = deque()
+        self.next_game = None
+        self.chat_init()
+
+    def replay(self, events, result):
+        self.replaying = True
+        for ev in events:
+            if not self.apply_ev(ev):
+                break
+        self.replaying = False
+        self.anim, self.choice = None, None
+        if hasattr(self, "pause_until"):
+            self.pause_until, self.banner = 0.0, None
+            self.fade = {k: 0.0 for k in self.fade}
+        if result and not self.result:
+            self.result = result
+
+    def click(self, pos):
+        pass                                          # watching only (planning arrows still work)
+
+    def send_chat(self, msg, team):
+        self.chat_add(None, "Spectators can't send messages", MUTED)
+
+    def close(self):
+        self.peer.close()
+
+    def spec_read(self):
+        while True:
+            msg = self.peer.get()
+            if msg is None:
+                return
+            t = msg.get("type")
+            if t == "spec":
+                self.squeue.append(msg.get("ev"))
+            elif t == "spec_chat":
+                col = msg.get("color")
+                col = tuple(col) if isinstance(col, list) and len(col) == 3 else TEXT
+                who = msg.get("who")
+                text_ = clean_chat(msg.get("text", ""))
+                if text_:
+                    self.chat_add(str(who)[:12] if who else None, text_, col)
+            elif t == "spec_start":                   # the players started a rematch (or a re-sync)
+                g = make_spectator(self.g, msg, self.peer)
+                if g:
+                    g.chat, g.tab, g.unread = self.chat, self.tab, self.unread
+                    self.next_game = g
+                    return
+            elif t == "spec_end":
+                self.chat_add(None, str(msg.get("text", "The game ended"))[:80], MUTED)
+            elif t == "_closed":
+                self.conn_lost = True             # shown once the moves already received have played out
+
+    def spec_update(self):
+        self.spec_read()
+        if getattr(self, "conn_lost", False) and not self.squeue and not self.result and not self.anim:
+            self.result = "Lost the connection to the game"
+        if self.next_game or self.animating() or time.time() < getattr(self, "pause_until", 0) or not self.squeue:
+            return
+        if not self.apply_ev(self.squeue.popleft()) and not self.result:
+            self.result = "Lost sync with the game"
+
+    def buttons(self):
+        return [("Menu", pygame.Rect(760, 650, 100, 40))] + self.extra_buttons()
+
+
+class SpecGame2P(SpecViewMixin, ChatMixin, Game2P):
+    def __init__(self, glyphs, info, peer):
+        super().__init__(glyphs, info["variant"], ELOS[0], 1)
+        self.spec_view_init(peer)
+        self.white, self.black = str(info.get("white", "?"))[:12], str(info.get("black", "?"))[:12]
+        self.me_label, self.opp_label = "White", "Black"
+        self.title += " (watching)"
+        clock = info.get("clock") or {}
+        for k, side in (("1", 1), ("-1", -1)):
+            if isinstance(clock.get(k), (int, float)):
+                self.clock[side] = float(clock[k])
+
+    def subtitle(self):
+        return "%s vs %s" % (self.white, self.black)
+
+    def side_text(self):
+        return "Spectating: %s is White" % self.white
+
+    def status_text(self):
+        if self.result:
+            return "Game over"
+        side = "White" if self.board.turn == 1 else "Black"
+        return ("%s in check" if self.board.in_check() else "%s to move") % side
+
+    def apply_ev(self, ev):
+        try:
+            if ev[0] == "m":
+                mv = tuple(int(x) for x in ev[1])
+                if self.result or not move_ok(mv, self.legal, PROMO_KIND, 4):
+                    return bool(self.result)
+                self.play(mv)
+                clock = ev[2] if len(ev) > 2 else {}
+                for k, side in (("1", 1), ("-1", -1)):
+                    if isinstance(clock.get(k), (int, float)):
+                        self.clock[side] = float(clock[k])
+            elif ev[0] == "end":
+                if not self.result:
+                    self.result = str(ev[1])[:60]
+            return True
+        except (IndexError, TypeError, ValueError, AttributeError):
+            return False
+
+    def update(self):
+        now = time.time()
+        dt, self.tick = now - self.tick, now
+        self.spec_update()
+        if self.blitz and not self.result and not self.animating():
+            t = self.board.turn
+            self.clock[t] = max(0.0, self.clock[t] - dt)     # display only; the players' clocks decide
+
+    def extra_buttons(self):
+        return [("Flip board", pygame.Rect(870, 650, 100, 40))]
+
+
+class SpecGame4P(SpecViewMixin, ChatMixin, Game4P):
+    def __init__(self, glyphs, info, peer):
+        v = info["variant"]
+        super().__init__(glyphs, int(info.get("elo", 900)), "military" if v in ("4pmil", "4pfull") else "standard",
+                         v in ("4parmy", "4pfull"), bool(info.get("teams")))
+        self.spec_view_init(peer)
+        self.variant = v
+        self.human, self.rot = -1, 0
+        names = info.get("names")
+        self.names = [str(n)[:10] if n else None for n in names] if isinstance(names, list) and len(names) == 4 \
+            else [None] * 4
+        self.title += " (watching)"
+
+    def subtitle(self):
+        return "Spectating - " + ("Teams 2v2" if self.teams else "Free-for-all")
+
+    def player_name(self, p):
+        return self.names[p] or PLAYER_NAMES[p] + " bot"
+
+    def seat_label(self, p):
+        return self.player_name(p) + ("" if self.b.alive[p] else " (out)")
+
+    def finish(self):
+        super().finish()
+        self.result = self.result_neutral
+
+    def apply_ev(self, ev):
+        try:
+            if ev[0] == "m":
+                p, mv = int(ev[1]), tuple(int(x) for x in ev[2])
+                if self.result:
+                    return True
+                if p != self.b.turn or not move_ok(mv, self.legal, PROMO4, 1):
+                    return False
+                self.play(mv)
+            elif ev[0] == "r":
+                self.resign_seat(int(ev[1]))
+            elif ev[0] == "end":
+                if not self.result:
+                    self.result = str(ev[1])[:60]
+            return True
+        except (IndexError, TypeError, ValueError):
+            return False
+
+    def update(self):
+        self.spec_update()
+
+    def extra_buttons(self):
+        return [("Speed: 4x" if self.fast else "Speed: 1x", pygame.Rect(870, 650, 100, 40))]
+
+
+def make_spectator(glyphs, msg, peer):
+    """Build the spectator view from a player's spec_start snapshot."""
+    try:
+        info = msg["info"]
+        if info.get("kind") == 2 and info.get("variant") in LAN_VARIANTS:
+            g = SpecGame2P(glyphs, info, peer)
+        elif info.get("kind") == 4 and info.get("variant") in LAN4_VARIANTS:
+            g = SpecGame4P(glyphs, info, peer)
+        else:
+            return None
+        events = msg.get("events")
+        g.replay(events if isinstance(events, list) else [], msg.get("result"))
+        return g
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
 def describe_challenge(msg):
     v = msg["variant"]
     label = dict(VARIANTS)[v]
@@ -2809,10 +3191,13 @@ class Lobby:
     START_BOTS = pygame.Rect(650, 470, 250, 50)
     BACK = pygame.Rect(80, 680, 200, 50)
     INBOX = pygame.Rect(300, 680, 240, 50)
+    WATCH_INPUT = pygame.Rect(250, 584, 380, 44)
+    WATCH_BTN = pygame.Rect(650, 584, 190, 44)
 
     def __init__(self, app):
         self.app = app
         self.slots = [Slot() for _ in range(3)]
+        self.watch = Slot()         # "watch a game": the address of any player in that game
         self.focus = 0
         self.active = False         # challenges are out
         self.c_variant, self.c_teams, self.c_side, self.c_seat = None, False, 1, 0
@@ -2899,12 +3284,68 @@ class Lobby:
         return msg
 
     # per-frame
+    # watching
+    def start_watch(self):
+        w = self.watch
+        if w.state:
+            return
+        try:
+            host, port = parse_address(w.text)
+        except ValueError:
+            host = ""
+        if not host:
+            self.say("Type the address of a player in the game you want to watch.", ERR)
+            return
+        w.state = "connecting"
+        self.say("Connecting to %s:%d to watch..." % (host, port))
+        threading.Thread(target=self._connect, args=("w", host, port), daemon=True).start()
+
+    def stop_watch(self, status=None, color=MUTED):
+        self.watch.reset()
+        if status is not None:
+            self.say(status, color)
+
+    def pump_watch(self):
+        w = self.watch
+        while w.peer:
+            msg = w.peer.get()
+            if msg is None:
+                break
+            t = msg.get("type")
+            if t == "spec_start":
+                g = make_spectator(self.app.glyphs, msg, w.peer)
+                if g is None:
+                    self.stop_watch("Couldn't read that game (different game version?)", ERR)
+                    return
+                w.reset(keep_peer=True)
+                self.say("")
+                self.app.inbox.decline_all()
+                self.app.begin_net_game(g)
+                return
+            if t == "decline":
+                self.stop_watch("Can't watch: %s." % (msg.get("reason") or "declined"), ERR)
+            elif t == "_closed":
+                self.stop_watch("Can't watch: the connection was closed.", ERR)
+
     def pump(self):
         while True:
             try:
                 i, ok, res, (host, port) = self.connect_q.get_nowait()
             except queue.Empty:
                 break
+            if i == "w":
+                if self.watch.state != "connecting":
+                    if ok:
+                        res.close()
+                elif not ok:
+                    short, why = connect_error(res)
+                    self.stop_watch("%s: %s (%s)" % (host, short, why), ERR)
+                else:
+                    res.settimeout(None)
+                    self.watch.peer, self.watch.state = Peer(res, (host, port)), "waiting"
+                    self.watch.peer.send({"type": "spectate", "proto": NET_PROTO, "name": self.name})
+                    self.say("Asking to watch %s's game..." % host)
+                continue
             slot = self.slots[i]
             if not self.active or slot.state != "connecting":     # cancelled meanwhile
                 if ok:
@@ -2918,6 +3359,7 @@ class Lobby:
             res.settimeout(None)
             slot.peer, slot.state, slot.note = Peer(res, (host, port)), "waiting", "Waiting for answer..."
             slot.peer.send(self.challenge_msg(i))
+        self.pump_watch()
         if not self.active:
             return
         for i, slot in enumerate(self.slots):
@@ -2994,10 +3436,21 @@ class Lobby:
     def click(self, pos):
         if self.BACK.collidepoint(pos):
             self.cancel("")
+            self.stop_watch()
             self.app.state = "menu"
             return
         if self.INBOX.collidepoint(pos):
             self.app.state = "challenges"
+            return
+        if self.WATCH_INPUT.collidepoint(pos):
+            self.focus = "w"
+            return
+        if self.WATCH_BTN.collidepoint(pos):
+            if self.watch.state:
+                self.stop_watch("Stopped.")
+            else:
+                self.focus = "w"
+                self.start_watch()
             return
         if self.active:
             if self.CANCEL.collidepoint(pos):
@@ -3012,14 +3465,19 @@ class Lobby:
             self.challenge()
 
     def key(self, e):
-        if self.active:
+        order = ([] if self.active else list(range(self.n_slots()))) + ["w"]
+        if self.focus not in order:
+            self.focus = order[0]
+        if e.key == pygame.K_TAB:
+            k = order.index(self.focus) + (-1 if e.mod & pygame.KMOD_SHIFT else 1)
+            self.focus = order[k % len(order)]
             return
-        self.focus = min(self.focus, self.n_slots() - 1)
-        slot = self.slots[self.focus]
+        watching = self.focus == "w"
+        slot = self.watch if watching else self.slots[self.focus]
+        if watching and self.watch.state:
+            return
         if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-            self.challenge()
-        elif e.key == pygame.K_TAB:
-            self.focus = (self.focus + (-1 if e.mod & pygame.KMOD_SHIFT else 1)) % self.n_slots()
+            self.start_watch() if watching else self.challenge()
         elif e.key == pygame.K_BACKSPACE:
             slot.text = slot.text[:-1]
         elif e.unicode and e.unicode.isprintable() and not e.unicode.isspace() and len(slot.text) < 40:
@@ -3052,14 +3510,15 @@ class Lobby:
         text(s, "Opponent's IP address" if not is4(v) else
              "IP addresses of the other players  (leave a seat empty for a bot)", 24, (80, 228), MUTED)
         n = self.n_slots()
-        self.focus = min(self.focus, n - 1)
+        if self.focus != "w":
+            self.focus = min(self.focus, n - 1)
         for i in range(n):
             slot, r = self.slots[i], self.input_rect(i)
             label, col = self.slot_label(i)
             if is4(v):
                 pygame.draw.circle(s, col, (90, r.centery), 8)
             text(s, label, 26, (106 if is4(v) else 80, r.y + 14), TEXT)
-            editing = not self.active and i == self.focus
+            editing = not self.active and i == self.focus and self.focus != "w"
             pygame.draw.rect(s, (24, 22, 20), r, border_radius=8)
             pygame.draw.rect(s, ACCENT if editing else (68, 64, 60), r, 2, border_radius=8)
             caret = "|" if editing and int(time.time() * 2) % 2 else ""
@@ -3080,10 +3539,20 @@ class Lobby:
             button(s, self.START_BOTS, "Start with bots")
         if self.status:
             text(s, self.status, 24, (W // 2, 552), self.status_color, center=True)
-        text(s, "Everyone needs this same game, on the same network. If nobody can reach you, allow Python /",
-             20, (W // 2, 600), MUTED, center=True)
-        text(s, "TCP port %d through your firewall.  Tab moves between address boxes." % NET_PORT, 20,
-             (W // 2, 622), MUTED, center=True)
+        # watch a friend's game
+        w, r = self.watch, self.WATCH_INPUT
+        text(s, "Watch a game", 26, (80, r.y + 12), TEXT)
+        editing = self.focus == "w" and not w.state
+        pygame.draw.rect(s, (24, 22, 20), r, border_radius=8)
+        pygame.draw.rect(s, ACCENT if editing else (68, 64, 60), r, 2, border_radius=8)
+        caret = "|" if editing and int(time.time() * 2) % 2 else ""
+        if w.text or editing:
+            text(s, w.text + caret, 30, (r.x + 12, r.y + 11))
+        else:
+            text(s, "a player's address", 30, (r.x + 12, r.y + 11), (100, 96, 90))
+        button(s, self.WATCH_BTN, "Stop" if w.state else "Watch")
+        text(s, "Same game + same network for everyone. If nobody can reach you, allow Python / TCP port %d "
+             "through your firewall." % NET_PORT, 19, (W // 2, 646), MUTED, center=True)
         button(s, self.BACK, "Back")
         inbox.draw_button(s, self.INBOX)
 
@@ -3136,7 +3605,23 @@ class Inbox:
                 self.remove(e, {"type": "decline", "reason": "busy"})
 
     def busy(self):
-        return self.app.state == "game" and isinstance(self.app.game, (NetGame2P, NetGame4P))
+        return self.app.state == "game" and isinstance(self.app.game, (NetGame2P, NetGame4P, SpecGame2P,
+                                                                       SpecGame4P))
+
+    def spectate(self, e, msg):
+        """Someone wants to watch the LAN game we are playing."""
+        g = self.app.game if self.app.state == "game" else None
+        who = str(msg.get("name") or e["peer"].addr)[:20]
+        if msg.get("proto") != NET_PROTO:
+            self.remove(e, {"type": "decline", "reason": "different game version"})
+        elif not isinstance(g, (NetGame2P, NetGame4P)):
+            self.remove(e, {"type": "decline", "reason": "they aren't playing a LAN game right now"})
+        elif len(g.specs) >= g.MAX_SPECS:
+            self.remove(e, {"type": "decline", "reason": "too many spectators"})
+        else:
+            self.entries.remove(e)                  # the game owns this connection now
+            g.add_spectator(e["peer"], who)
+            self.toast = ("%s is watching your game" % who, time.time() + 4)
 
     def pump(self):
         if self.listener:
@@ -3145,7 +3630,7 @@ class Inbox:
                 if got is None:
                     break
                 p = Peer(*got)
-                if self.busy() or len(self.entries) >= self.MAX:
+                if len(self.entries) >= self.MAX + 4:
                     p.send({"type": "decline", "reason": "busy"})
                     p.close()
                 else:
@@ -3157,7 +3642,11 @@ class Inbox:
                     break
                 t = msg.get("type")
                 if e["msg"] is None:
-                    if t == "challenge" and valid_challenge(msg):
+                    if t == "spectate":
+                        self.spectate(e, msg)
+                    elif t == "challenge" and (self.busy() or len(self.ready()) >= self.MAX):
+                        self.remove(e, {"type": "decline", "reason": "busy"})
+                    elif t == "challenge" and valid_challenge(msg):
                         e["msg"] = msg
                         who = str(msg.get("name") or e["peer"].addr)[:20]
                         self.toast = ("Challenge from %s - see Challenges" % who, time.time() + 6)
@@ -3356,7 +3845,7 @@ class App:
     def leave_game(self):
         """Back out of the current game: LAN games hang up and return to the LAN / Challenges screen."""
         self.game.dead = True
-        if isinstance(self.game, (NetGame2P, NetGame4P)):
+        if isinstance(self.game, (NetGame2P, NetGame4P, SpecGame2P, SpecGame4P)):
             self.game.close()
             self.state = self.game.back_to
             self.lobby.say("")
@@ -3468,6 +3957,7 @@ class App:
                             self.leave_game()
                         elif self.state == "lan":
                             self.lobby.cancel("")
+                            self.lobby.stop_watch()
                             self.state = "menu"
                         elif self.state == "challenges":
                             self.state = "menu"
@@ -3475,10 +3965,15 @@ class App:
                         self.lobby.key(e)
                 if e.type == pygame.MOUSEBUTTONDOWN:
                     if e.button == 1:
+                        if self.state == "game":
+                            self.game.plan_clear()          # a left click wipes the planning arrows / marks
                         {"menu": self.menu_click, "lan": self.lobby.click, "challenges": self.inbox.click,
                          "game": self.game_click}[self.state](e.pos)
                     elif e.button == 3 and self.state == "game":
                         self.game.cancel()
+                        self.game.plan_down(e.pos)
+                if e.type == pygame.MOUSEBUTTONUP and e.button == 3 and self.state == "game":
+                    self.game.plan_up(e.pos)
             self.lobby.pump()
             self.inbox.pump()
             if self.state == "menu":
@@ -3489,8 +3984,10 @@ class App:
                 self.inbox.draw(self.screen)
             else:
                 self.game.update()
-                if getattr(self.game, "next_game", None):       # LAN rematch agreed by both players
-                    self.game = self.game.next_game
+                if getattr(self.game, "next_game", None):       # LAN rematch / re-sync: swap in the new game
+                    old, self.game = self.game, self.game.next_game
+                    if hasattr(self.game, "adopt_spectators"):
+                        self.game.adopt_spectators(old)
                 self.screen.fill(BG)
                 self.game.draw(self.screen)
                 text(self.screen, "Enter = chat    F = fullscreen" if hasattr(self.game, "chat_key")
