@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pygame Chess  -  Normal / Blitz / Military / 4 Player
+Pygame Chess  -  Normal / Blitz / Army / Military / 4 Player
 Bots from ~100 to ~1500 Elo.   Install:  pip3 install pygame-ce    Run:  python3 chess_game.py
 LAN play: challenge other players on the same network by IP address (all variants, TCP port 5555),
 watch friends' games, and run single-elimination tournaments (Tournament button on the menu).
@@ -1372,8 +1372,8 @@ class Game2P(AnimMixin, ChoiceMixin, PlanMixin):
         self.ox = 20 + (BOARD_PX - self.cell * self.board.cols) // 2
         self.oy = 20 + (BOARD_PX - self.cell * self.board.rows) // 2
         self.dead = False
-        self.title = {"normal": "Normal Chess", "blitz": "Blitz 3+2", "military": "Military Chess",
-                      "army": "Army Chess", "fullarmy": "Full Army"}[variant]
+        self.title = {"normal": "Normal Chess", "blitz": "Blitz 3+2", "military": "Army Chess",
+                      "army": "Military Chess", "fullarmy": "Full Military"}[variant]
 
     # geometry
     def sq_to_xy(self, i):
@@ -1721,7 +1721,8 @@ class Game4P(AnimMixin, ChoiceMixin, PlanMixin):
         self.banner = None
         self.fast = False
         self.dead = False
-        self.title = "4 Player" + ((" Full Army" if army else " Military") if layout == "military" else (" Army" if army else "")) \
+        self.title = "4 Player" + ((" Full Military" if army else " Army") if layout == "military" else
+                                   (" Military" if army else "")) \
             + (" 2v2" if teams else "")
 
     def name(self, i):
@@ -4777,21 +4778,23 @@ class TournamentView:
 # ----------------------------------------------------------------------------
 # App / menu
 # ----------------------------------------------------------------------------
-VARIANTS = [("normal", "Normal"), ("blitz", "Blitz"), ("military", "Military"), ("army", "Army"),
-            ("fullarmy", "Full Army"), ("4p", "4 Player"), ("4pmil", "4P Military"), ("4parmy", "4P Army"),
-            ("4pfull", "4P Full Army")]
+# Display names.  The internal keys stay as they were (they are part of the LAN protocol):
+#   "military" = the 9x10 / 17x17 layout, shown as "Army";  "army" = the modern units, shown as "Military".
+VARIANTS = [("normal", "Normal"), ("blitz", "Blitz"), ("military", "Army"), ("army", "Military"),
+            ("fullarmy", "Full Military"), ("4p", "4 Player"), ("4pmil", "4P Army"), ("4parmy", "4P Military"),
+            ("4pfull", "4P Full Military")]
 ARMY_RULES = ("Soldier fires at the piece ahead, Helicopter jumps twice, Artillery fires at any piece (3-turn cooldown), "
               "Tank rolls over enemy pieces to its square, Jet blasts every enemy non-king piece next to its capture.")
 DESCR = {
     "normal": "Standard chess: castling, en passant, 50-move and repetition draws. Promote to Q, R, B or N.",
     "blitz": "Standard chess with a 3 minute clock and a 2 second increment per move.",
     "military": "9x10 board. Per side: back row of rooks & queens, a row of knights & bishops, two rows of pawns.",
-    "army": "Standard rules with modern-army units. " + ARMY_RULES,
-    "fullarmy": "Military layout (9x10) with the Army units: lots of tanks, artillery and helicopters. " + ARMY_RULES,
+    "army": "Standard rules with modern military units. " + ARMY_RULES,
+    "fullarmy": "Army layout (9x10) with the Military units: lots of tanks, artillery and helicopters. " + ARMY_RULES,
     "4p": "Free-for-all on a 14x14 cross board with castling. Red moves first, then Blue, Yellow, Green.",
-    "4pmil": "4 Player on a 17x17 cross board with the Military setup (4 rows per side). No castling.",
-    "4parmy": "4 Player free-for-all with the Army units. " + ARMY_RULES,
-    "4pfull": "4 Player on the 17x17 Military layout with the Army units. " + ARMY_RULES,
+    "4pmil": "4 Player on a 17x17 cross board with the Army setup (4 rows per side). No castling.",
+    "4parmy": "4 Player free-for-all with the Military units. " + ARMY_RULES,
+    "4pfull": "4 Player on the 17x17 Army layout with the Military units. " + ARMY_RULES,
 }
 TEAMS_NOTE = " TEAMS 2v2: Red + Yellow vs Blue + Green. Allies never capture, shoot or blast each other."
 
