@@ -4159,6 +4159,8 @@ class Relay2P:
     """A 2-player tournament match run by the organizer.  Humans connect to it exactly as they would to a LAN
     opponent (it forwards each side's moves to the other); bot sides are played here."""
     MAX_PLIES = 400
+    MAX_REPLAYS = 3                        # stalemates replayed (colors swapped) before a coin toss decides
+    REPLAY_DELAY = 3.0                     # seconds to show the stalemate before the replay starts
     BOT_DELAY, BOT_DELAY_ALL_BOTS = 0.3, 0.75      # seconds; all-bot games are paced so spectators can follow
 
     def __init__(self, td, match, white, black):
@@ -4172,6 +4174,7 @@ class Relay2P:
         self.tick = time.time()
         self.events, self.specs = [], []
         self.result, self.winner, self.bot = None, None, None
+        self.replays, self.replay_at = 0, None
 
     def name(self, s):
         return self.players[s].label()
@@ -4225,7 +4228,7 @@ class Relay2P:
             if b.in_check():
                 self.finish(mover, "Checkmate")
             else:
-                self.draw("stalemate")
+                self.stalemate()
         elif b.halfmove >= 100:
             self.draw("50-move rule")
         elif b.history.count(b.key()) >= 3:
@@ -4241,6 +4244,28 @@ class Relay2P:
 
     def draw(self, why):
         self.finish(-1, "Draw (%s) - Black advances" % why)
+
+    def stalemate(self):
+        """A stalemate is replayed with colors swapped instead of handing Black the match."""
+        if self.replays >= self.MAX_REPLAYS:
+            self.finish(random.choice((1, -1)), "Stalemate %d times, coin toss" % (self.replays + 1))
+            return
+        self.result = "Stalemate - replaying with colors swapped"
+        self.replay_at = time.time() + self.REPLAY_DELAY
+        self.spec_send({"type": "spec", "ev": ["end", self.result]})
+        self.td.replay_pending(self.match, "%s vs %s: stalemate - replaying with colors swapped" %
+                               (self.name(1), self.name(-1)))
+
+    def replay(self):
+        """The rematch after a stalemate: same match, colors swapped; watchers follow along."""
+        new = Relay2P(self.td, self.match, self.players[-1], self.players[1])
+        new.replays = self.replays + 1
+        new.start()
+        for e in self.specs:
+            if e.alive:
+                new.add_spectator(e, "")
+        self.specs = []
+        return new
 
     def finish(self, winner, why):
         if self.result:
@@ -4384,6 +4409,7 @@ class TournamentDirector:
         self.champions = None
         self.cur_round = -1
         self.dirty = False
+        self.chat = TournamentChat(lambda msg: self.post_chat(self.me, msg))
 
     # ---- setup -------------------------------------------------------------
     def teams(self):
@@ -4473,6 +4499,9 @@ class TournamentDirector:
                 if msg is None:
                     break
                 t = msg.get("type")
+                if t == "t_chat" and inv["state"] == "accepted":
+                    self.post_chat(i, msg.get("text", ""), name=inv["name"])
+                    continue
                 if t == "t_accept" and inv["state"] == "waiting":
                     inv["state"], inv["name"] = "accepted", str(msg.get("name") or p.addr)[:16]
                     inv["note"] = "Joined - " + inv["name"]
@@ -4525,6 +4554,30 @@ class TournamentDirector:
 
     def remotes(self):
         return [p for p in self.players if p.kind == "remote" and not p.gone]
+
+    def chat_peers(self):
+        """(sender key, connection) for everyone who should get tournament chat right now."""
+        if self.phase == "inviting":
+            return [(i, inv["peer"]) for i, inv in self.invites.items() if inv["state"] == "accepted" and inv["peer"]]
+        return [(p, p.conn) for p in self.remotes()]
+
+    def post_chat(self, sender, msg, name=None):
+        """sender: self.me (the organizer typed it), a TPlayer / invite slot (relayed), or None (system note)."""
+        msg = clean_chat(msg)
+        if not msg:
+            return
+        if name is None and sender is not None and sender is not self.me:
+            name = sender.label() if isinstance(sender, TPlayer) else str(sender)
+        if sender is self.me:
+            name = self.me.name
+        elif sender is not None or name is None:
+            self.chat.receive(name, msg, self.app.state == "tournament")
+        for key, conn in self.chat_peers():
+            if key is not sender and key != sender:
+                conn.send({"type": "t_chat", "who": name, "text": msg})
+
+    def note(self, msg):
+        self.post_chat(None, msg)
 
     def next_cid(self):
         self.cid += 1
@@ -4581,6 +4634,7 @@ class TournamentDirector:
         else:
             entrants = [s for m in self.matches if m.round == r - 1 for s in m.winners]
         self.cur_round, self.round_done_at = r, None
+        self.note("Final started" if r == self.rounds - 1 else "Round %d started" % (r + 1))
         for j in range(0, len(entrants), k):
             m = TMatch(len(self.matches), r, entrants[j:j + k])
             self.matches.append(m)
@@ -4613,11 +4667,19 @@ class TournamentDirector:
                 peers[seat] = self.join(p, {"kind": 4, "variant": self.v, "teams": self.tm, "seat": seat,
                                             "names": names, "elo": self.elo})
 
+    def replay_pending(self, m, msg):
+        m.note = "Stalemate - replaying"
+        self.dirty = True
+        self.note(msg)
+
     def match_done(self, m, winner_slots, note):
         if m.status == "done":
             return
         m.status, m.winners, m.note = "done", winner_slots, note
         self.dirty = True
+        out = [self.players[s].label() for s in m.slots if s not in winner_slots]
+        self.note("%s advance%s (%s)" % (" & ".join(self.players[s].label() for s in winner_slots),
+                                        "" if len(winner_slots) > 1 else "s", ", ".join(out) + " out"))
 
     def pump(self):
         if self.phase in ("setup", "inviting"):
@@ -4633,8 +4695,11 @@ class TournamentDirector:
                 t = msg.get("type")
                 if t == "t_watch":
                     self.watch(p, msg.get("match"))
+                elif t == "t_chat":
+                    self.post_chat(p, msg.get("text", ""))
                 elif t == "_closed":
                     p.gone = True
+                    self.note("%s left the tournament" % p.name)
                     for vp in p.routes.values():
                         vp.feed({"type": "_closed"})
                     self.dirty = True
@@ -4643,6 +4708,11 @@ class TournamentDirector:
             if m.server is None:
                 continue
             if isinstance(m.server, Relay2P):
+                if m.server.replay_at and time.time() >= m.server.replay_at and m.status == "live":
+                    m.server.replay_at = None
+                    m.server = m.server.replay()
+                    m.note = "Replay %d (after stalemate)" % m.server.replays
+                    self.dirty = True
                 m.server.pump()
             else:
                 m.server.update()
@@ -4657,6 +4727,7 @@ class TournamentDirector:
                     self.champions = [s for m in final for s in m.winners]
                     self.phase = "done"
                     self.dirty = True
+                    self.note("Champion: " + " & ".join(self.players[s].label() for s in self.champions))
                 elif self.round_done_at is None:
                     self.round_done_at = time.time()
                 elif time.time() - self.round_done_at > T_SWITCH_DELAY:
@@ -4740,9 +4811,10 @@ class TournamentDirector:
         v = self.v if self.phase == "inviting" else self.app.variant
         tm = self.tm if self.phase == "inviting" else self.teams()
         label = dict(VARIANTS)[v] + (" - Teams 2v2" if tm else "")
-        rule = {2: "draws: Black advances", 4: "winning pair advances" if tm else "top score advances"}[
+        rule = {2: "stalemate: replay, other draws: Black advances",
+                4: "winning pair advances" if tm else "top score advances"}[
             4 if is4(v) else 2]
-        text(s, "Game: %s   (bots Elo %d, %s)  - change in the main menu" % (label, self.app.elo, rule), 22,
+        text(s, "Game: %s  (bots Elo %d; %s) - set in the main menu" % (label, self.app.elo, rule), 20,
              (80, 92), MUTED)
         n = self.n_players()
         text(s, "Rounds", 26, (80, 136), TEXT)
@@ -4800,6 +4872,7 @@ class TournamentClient:
         self.routes = {}
         self.pending_spec = None
         self.ended = None
+        self.chat = TournamentChat(lambda msg: self.conn.send({"type": "t_chat", "text": msg}))
 
     def watch(self, mid):
         if not self.ended:
@@ -4837,6 +4910,8 @@ class TournamentClient:
                 vp = VirtualPeer(self.conn, msg.get("c"))
                 self.routes[msg.get("c")] = vp
                 self.pending_spec = vp
+            elif t == "t_chat":
+                self.chat.receive(msg.get("who"), msg.get("text", ""), self.app.state == "tournament")
             elif t == "t_end":
                 self.ended = str(msg.get("reason") or "The tournament ended")[:80]
             elif t == "_closed":
@@ -4869,11 +4944,47 @@ def valid_tinvite(m):
         and m.get("rounds") in (1, 2, 3, 4) and isinstance(m.get("slot"), int)
 
 
+class TournamentChat(ChatMixin):
+    """The chat panel on the bracket screen: everyone in the tournament, relayed by the organizer."""
+    INPUT_Y = 640
+    CHAT_TOP_PAD = 0
+    PANEL = pygame.Rect(750, 108, 244, 574)
+
+    def __init__(self, send):
+        self.chat_init()
+        self.tab = "chat"
+        self.send = send
+        self.away = 0                      # messages that arrived while you weren't on the bracket screen
+
+    def chat_rects(self):
+        off = pygame.Rect(-500, -500, 1, 1)
+        return off, off, None, pygame.Rect(760, self.INPUT_Y, 230, 36)
+
+    def send_chat(self, msg, team):
+        self.send(msg)
+        self.chat_add("You", msg, ME_COLOR)
+
+    def receive(self, who, msg, on_screen):
+        msg = clean_chat(msg)
+        if not msg:
+            return
+        self.chat_add(str(who)[:12] if who else None, msg, OPP_COLOR if who else MUTED)
+        if not on_screen and who:
+            self.away += 1
+
+    def draw_panel(self, s):
+        pygame.draw.rect(s, PANEL, self.PANEL, border_radius=10)
+        text(s, "Tournament chat", 26, (760, 118), TEXT)
+        self.away = 0
+        self.draw_log(s, 760, 150)
+
+
 class TournamentView:
     """The bracket screen (organizer and players).  Click a LIVE match to watch it."""
     BACK = pygame.Rect(80, 690, 200, 46)
     END = pygame.Rect(300, 690, 230, 46)
-    RETURN = pygame.Rect(690, 690, 250, 46)
+    RETURN = pygame.Rect(550, 690, 190, 46)
+    BRACKET_W = 700                        # the chat panel sits to the right
     TOP, BOTTOM = 150, 670
 
     def __init__(self, app):
@@ -4887,11 +4998,17 @@ class TournamentView:
             return a.tclient.state, a.tclient.slot, None, False
         return None, None, None, False
 
+    def chat(self):
+        a = self.app
+        if a.td and a.td.phase != "setup":
+            return a.td.chat
+        return a.tclient.chat if a.tclient else None
+
     def boxes(self, st):
         """(match id or None, rect, slots or None) for every bracket position."""
         sizes = t_round_sizes(st["variant"], st["teams"], st["rounds"])
         k = t_layout(st["variant"], st["teams"])[0]
-        colw = (W - 80) // st["rounds"]
+        colw = self.BRACKET_W // st["rounds"]
         out = []
         for r, size in enumerate(sizes):
             count = size // k
@@ -4920,7 +5037,7 @@ class TournamentView:
             return "Organizing - click a LIVE match to watch it"
         mine = [m for m in st["matches"] if me in m["slots"]]
         if mine and mine[-1]["status"] == "live":
-            return "Your match is still going - press Return to my match" if self.app.parked else \
+            return "Your match is still going - press Return to match" if self.app.parked else \
                 "Your match is being played"
         if mine and me not in mine[-1]["winners"]:
             return "You're out - click a LIVE match to watch"
@@ -4928,6 +5045,9 @@ class TournamentView:
 
     def click(self, pos):
         a = self.app
+        ch = self.chat()
+        if ch and ch.chat_click(pos):
+            return
         st, me, _, director = self.source()
         if self.BACK.collidepoint(pos):
             a.state = "menu"
@@ -4962,11 +5082,12 @@ class TournamentView:
         title = "TOURNAMENT"
         if st:
             title += " - " + dict(VARIANTS)[st["variant"]] + (" 2v2" if st["teams"] else "")
-        text(s, title, 46, (W // 2, 40), TEXT, center=True)
+        text(s, title, 46, (40 + self.BRACKET_W // 2, 40), TEXT, center=True)
         ended = a.tclient.ended if (a.tclient and not director) else None
-        text(s, ended or self.my_status(st, me), 28, (W // 2, 84), ERR if ended else ACCENT, center=True)
+        text(s, ended or self.my_status(st, me), 26, (40 + self.BRACKET_W // 2, 84), ERR if ended else ACCENT,
+             center=True)
         if st:
-            colw = (W - 80) // st["rounds"]
+            colw = self.BRACKET_W // st["rounds"]
             for r in range(st["rounds"]):
                 name = "Final" if r == st["rounds"] - 1 else "Semifinals" if r == st["rounds"] - 2 \
                     else "Round %d" % (r + 1)
@@ -5002,15 +5123,17 @@ class TournamentView:
                 if st["teams"] and len(m["slots"]) == 4:      # pairs are teams
                     yy = rect.y + 4 + 2 * rh - 1
                     pygame.draw.line(s, (68, 64, 60), (rect.x + 6, yy), (rect.right - 6, yy), 1)
-                note = m["note"] if m["status"] == "done" else ("LIVE - click to watch" if hover else "")
+                note = m["note"] if m["status"] == "done" else ("LIVE - click to watch" if hover else m["note"])
                 if note:
                     text(s, note[:int(rect.w / 6.5)], max(12, rh - 3), (rect.x + 8, rect.y + 5 + len(m["slots"]) * rh),
                          ACCENT if live else MUTED)
                 if live:
                     text(s, "LIVE", max(13, rh - 2), (rect.right - 6, rect.y + 4), ACCENT, right=True)
+        if self.chat():
+            self.chat().draw_panel(s)
         button(s, self.BACK, "Menu")
         if a.parked:
-            button(s, self.RETURN, "Return to my match", selected=not a.parked.result)
+            button(s, self.RETURN, "Return to match", selected=not a.parked.result)
         button(s, self.END, ("End tournament" if director else "Leave tournament") if not
                (st and st.get("champions")) else "Close tournament")
 
@@ -5247,6 +5370,9 @@ class App:
                     self.internet.close()          # stop forwarding the port on the router
                     pygame.quit()
                     sys.exit()
+                if e.type == pygame.KEYDOWN and self.state == "tournament" and self.tview.chat() \
+                        and self.tview.chat().chat_key(e):
+                    continue
                 if e.type == pygame.KEYDOWN and self.state == "game" and hasattr(self.game, "chat_key") \
                         and self.game.chat_key(e):
                     continue
@@ -5313,6 +5439,10 @@ class App:
                      else "F = fullscreen", 18, (W - 12, 742), MUTED, right=True)
             if self.state != "challenges":
                 self.inbox.draw_toast(self.screen)
+            tchat = self.tview.chat()
+            if tchat and tchat.away and self.state != "tournament":     # new tournament chat while you're away
+                text(self.screen, "Tournament chat: %d new - open the bracket to read" % tchat.away, 18, (22, 3),
+                     ACCENT)
             pygame.display.flip()
             self.clock.tick(60)
 
