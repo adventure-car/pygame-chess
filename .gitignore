@@ -1,0 +1,4 @@
+__pycache__/
+*.bak
+chess_settings.json
+launcher_settings.json
