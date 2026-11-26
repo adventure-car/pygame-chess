@@ -3910,7 +3910,7 @@ def build_client_game(glyphs, info, peer):
                       list(info["names"]), host=peer)
         g.back_to = "tournament"
     g.tournament = True
-    g.HINT = "Tournament match - Menu goes back to the bracket"
+    g.HINT = "Tournament match over - Menu goes back to the bracket"
     return g
 
 
@@ -4311,8 +4311,11 @@ class TournamentDirector:
 
     def watch(self, p, mid):
         m = self.matches[mid] if isinstance(mid, int) and 0 <= mid < len(self.matches) else None
-        if not m or m.status != "live" or (p.slot is not None and p.slot in m.slots and p.is_human()):
+        if not m or m.status != "live":
             return
+        if p.is_human() and p.slot is not None and any(x.status == "live" and p.slot in x.slots for x in self.matches):
+            return                           # you're playing right now
+
         self.stop_watch(p)
         if p.kind == "you":
             a, b = pipe_pair()
@@ -4562,6 +4565,7 @@ class TournamentClient:
             self.conn.send({"type": "t_watch", "match": mid})
 
     def leave(self):
+        self.app.drop_parked()
         self.conn.close()
         g = self.app.game
         if self.app.state == "game" and getattr(g, "back_to", "") == "tournament":
@@ -4628,6 +4632,7 @@ class TournamentView:
     """The bracket screen (organizer and players).  Click a LIVE match to watch it."""
     BACK = pygame.Rect(80, 690, 200, 46)
     END = pygame.Rect(300, 690, 230, 46)
+    RETURN = pygame.Rect(690, 690, 250, 46)
     TOP, BOTTOM = 150, 670
 
     def __init__(self, app):
@@ -4674,7 +4679,8 @@ class TournamentView:
             return "Organizing - click a LIVE match to watch it"
         mine = [m for m in st["matches"] if me in m["slots"]]
         if mine and mine[-1]["status"] == "live":
-            return "Your match is being played"
+            return "Your match is still going - press Return to my match" if self.app.parked else \
+                "Your match is being played"
         if mine and me not in mine[-1]["winners"]:
             return "You're out - click a LIVE match to watch"
         return "You advance! Waiting for the next round - click a LIVE match to watch"
@@ -4685,8 +4691,12 @@ class TournamentView:
         if self.BACK.collidepoint(pos):
             a.state = "menu"
             return
+        if self.RETURN.collidepoint(pos) and a.parked:
+            a.return_to_match()
+            return
         if self.END.collidepoint(pos):
             if director:
+                a.drop_parked()
                 a.td.shutdown()
                 a.td = None
             elif a.tclient:
@@ -4695,6 +4705,8 @@ class TournamentView:
             return
         if not st:
             return
+        if a.parked and not a.parked.result:
+            return                           # finish (or return to) your own match first
         for m, rect, _ in self.boxes(st):
             if m and m["status"] == "live" and rect.collidepoint(pos):
                 if director:
@@ -4733,7 +4745,7 @@ class TournamentView:
                                                                b_.midleft], 2)
             for m, rect, rh in boxes:
                 live = m and m["status"] == "live"
-                hover = live and rect.collidepoint(mouse)
+                hover = live and rect.collidepoint(mouse) and not (a.parked and not a.parked.result)
                 pygame.draw.rect(s, (44, 42, 39) if hover else (28, 26, 24), rect, border_radius=6)
                 pygame.draw.rect(s, ACCENT if live else (68, 64, 60), rect, 2, border_radius=6)
                 if not m:
@@ -4756,6 +4768,8 @@ class TournamentView:
                 if live:
                     text(s, "LIVE", max(13, rh - 2), (rect.right - 6, rect.y + 4), ACCENT, right=True)
         button(s, self.BACK, "Menu")
+        if a.parked:
+            button(s, self.RETURN, "Return to my match", selected=not a.parked.result)
         button(s, self.END, ("End tournament" if director else "Leave tournament") if not
                (st and st.get("champions")) else "Close tournament")
 
@@ -4803,6 +4817,7 @@ class App:
         self.td = None                     # tournament we organize
         self.tclient = None                # tournament we joined
         self.tview = TournamentView(self)
+        self.parked = None                 # your live tournament match while you look at the bracket
         self.inbox.open()                  # challenges can arrive at any time
         pygame.key.set_repeat(400, 35)     # hold a key to repeat it (text boxes)
 
@@ -4853,7 +4868,19 @@ class App:
             old.dead = True
             if hasattr(old, "close"):
                 old.close()
+        self.drop_parked()
         self.begin_net_game(game)
+
+    def drop_parked(self):
+        if self.parked:
+            self.parked.dead = True
+            self.parked.close()
+            self.parked = None
+
+    def return_to_match(self):
+        if self.parked:
+            self.game, self.parked = self.parked, None
+            self.state = "game"
 
     def begin_net_game(self, game):
         if self.game:
@@ -4862,7 +4889,13 @@ class App:
         self.state = "game"
 
     def leave_game(self):
-        """Back out of the current game: LAN games hang up and return to the LAN / Challenges screen."""
+        """Back out of the current game: LAN games hang up and return to the LAN / Challenges screen.
+        A tournament match that is still being played is only set aside: it keeps running and you can return."""
+        g = self.game
+        if getattr(g, "tournament", False) and not g.result:
+            self.parked, self.game = g, None
+            self.state = "tournament"
+            return
         self.game.dead = True
         if isinstance(self.game, (NetGame2P, NetGame4P, SpecGame2P, SpecGame4P)):
             self.game.close()
@@ -5007,6 +5040,11 @@ class App:
                 self.td.pump()
             if self.tclient:
                 self.tclient.pump()
+            if self.parked:                         # a set-aside tournament match keeps running
+                self.parked.update()
+                if getattr(self.parked, "next_game", None):
+                    old, self.parked = self.parked, self.parked.next_game
+                    self.parked.adopt_spectators(old)
             if self.state == "menu":
                 self.draw_menu()
             elif self.state == "lan":
