@@ -1300,6 +1300,243 @@ def draw_legend(s, x, y):
     return y + 8
 
 
+# ----------------------------------------------------------------------------
+# Game review: classify every move of a finished 2-player game
+# ----------------------------------------------------------------------------
+REVIEW_CATS = [("Brilliant", (27, 172, 166)), ("Great", (92, 139, 220)), ("Best", (129, 182, 76)),
+               ("Good", (150, 175, 139)), ("Inaccuracy", (247, 198, 49)), ("Miss", (255, 119, 105)),
+               ("Blunder", (220, 50, 47))]
+REVIEW_COLOR = dict(REVIEW_CATS)
+CLAMP = 1500                       # mate scores count as +-15 pawns when measuring how much a move lost
+
+
+def _clamp(s):
+    return max(-CLAMP, min(CLAMP, s))
+
+
+def root_scores(b, depth, deadline):
+    """Score of every legal move for the side to move (full window, so the numbers are exact at this depth).
+    Works on a copy: a search that times out stops mid-move and would leave the board half-changed."""
+    b = b.copy()
+    ctx = Ctx()
+    ctx.deadline = deadline
+    legal = b.legal()
+    b.order(legal)
+    out = {}
+    for m in legal:
+        u = b.make(m)
+        try:
+            out[m] = -negamax(b, depth - 1, -INF, INF, 1, ctx)
+        finally:
+            b.unmake(u)
+    return out
+
+
+def mate_in_one(b):
+    """A move that checkmates right away for the side to move, or None."""
+    b = b.copy()
+    for m in b.legal():
+        u = b.make(m)
+        mate = b.in_check() and not b.legal()
+        b.unmake(u)
+        if mate:
+            return m
+    return None
+
+
+def fmt_move(b, m):
+    """Short notation for move m in position b (before it is played)."""
+    f, t, fl = m
+    name = lambda i: "%s%d" % (chr(97 + i % b.cols), i // b.cols + 1)
+    if fl == 2:
+        return "O-O"
+    if fl == 3:
+        return "O-O-O"
+    L = LETTER[abs(b.sq[f])]
+    if fl == 5:
+        return L + name(f) + "*" + name(t)
+    if fl >= 100:
+        return L + name(f) + "-" + name(fl - 100) + "-" + name(t)
+    s = L + name(f) + ("x" if (b.sq[t] != 0 or fl == 1) else "-") + name(t)
+    return s + ("=" + LETTER[PROMO_KIND[fl]] if fl in PROMO_KIND else "")
+
+
+def classify_move(b, m, budget, last_to=None):
+    """Return (category, centipawns lost, best move text) for move m played in position b."""
+    vals = ARMY_VALS if b.army else VALS
+    start = time.time()
+    scores = root_scores(b, 1, float("inf"))                 # always have an answer...
+    for depth, limit in ((2, max(2 * budget, 0.3)), (3, budget)):
+        try:                                                 # ...and look deeper while there is time
+            scores = root_scores(b, depth, start + limit)
+        except Timeout:
+            break
+    n = len(scores)
+    if m not in scores:                                      # under-promotion: score it on its own
+        bb = b.copy()
+        bb.make(m)
+        scores[m] = -negamax(bb, 1, -INF, INF, 1, Ctx())
+    # One-move mates matter most and a short search can miss them: check them directly.
+    mate = mate_in_one(b)
+    if mate is not None:
+        scores[mate] = MATE
+    after = b.copy()
+    after.make(m)
+    if not after.legal():
+        scores[m] = MATE if after.in_check() else min(scores[m], 0)
+    elif mate_in_one(after) is not None:
+        scores[m] = -MATE                                    # this move lets the opponent mate at once
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+    best_m, best = ranked[0][0], _clamp(ranked[0][1])
+    played = _clamp(scores[m])
+    second = _clamp(ranked[1][1]) if len(ranked) > 1 else best
+    loss = max(0, best - played)
+    best_txt = fmt_move(b, best_m)
+    if n <= 1 or loss <= 10:
+        f, t, fl = m
+        mover = b.turn
+        piece = abs(b.sq[f])
+        taken = abs(b.sq[t]) if b.sq[t] and fl != 5 else 0
+        sacrifice = False
+        if fl not in (2, 3, 5) and vals[piece] >= 300 and vals[piece] - vals[taken] >= 200:
+            u = b.make(m)
+            attacked = b.attacked(t, -mover)
+            defended = b.attacked(t, mover)
+            b.unmake(u)
+            sacrifice = attacked and (not defended or vals[piece] >= 500)
+        if n > 1 and sacrifice and loss <= 25 and played >= -50 and best < 700:
+            return "Brilliant", loss, best_txt
+        recapture = last_to is not None and t == last_to
+        if n > 1 and best - second >= 150 and -300 < best < 600 and not recapture:
+            return "Great", loss, best_txt                   # the only good move, and you found it
+        return "Best", loss, best_txt
+    if loss <= 50:
+        return "Good", loss, best_txt
+    if best >= 200 and played > -150 and loss >= 150:
+        return "Miss", loss, best_txt                        # a winning chance was there and slipped away
+    if loss <= 200:
+        return "Inaccuracy", loss, best_txt
+    return "Blunder", loss, best_txt
+
+
+class GameReview:
+    """Analyses a finished game in a background thread and draws the review over the board."""
+    BOX = pygame.Rect(20, 20, BOARD_PX, BOARD_PX)
+    CLOSE = pygame.Rect(20 + BOARD_PX - 170, 20 + BOARD_PX - 54, 150, 40)
+    TOTAL_BUDGET = 20.0                    # seconds of analysis for a whole game (roughly)
+
+    def __init__(self, game):
+        self.game = game
+        self.variant = getattr(game, "variant", "normal")
+        self.moves = list(game.moves)
+        self.texts = list(game.log[:len(self.moves)])
+        self.results = [None] * len(self.moves)
+        self.done, self.finished, self.sel = 0, False, None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        b = Board({"military": "military", "army": "army", "fullarmy": "fullarmy"}.get(self.variant, "normal"))
+        per = max(0.15, min(0.6, self.TOTAL_BUDGET / max(1, len(self.moves))))
+        last_to = None
+        for i, m in enumerate(self.moves):
+            if getattr(self.game, "dead", False):
+                return                                       # the game was closed: stop working
+            try:
+                self.results[i] = classify_move(b, m, per, last_to)
+            except Exception as exc:                         # never let a review crash the game
+                print("review error:", exc)
+                self.results[i] = None
+            try:
+                b.make(m)
+            except Exception:
+                break
+            last_to = m[1]
+            self.done = i + 1
+        self.finished = True
+
+    def counts(self, side):                                  # side 0 = White (even plies), 1 = Black
+        c = {name: 0 for name, _ in REVIEW_CATS}
+        for i in range(side, len(self.results), 2):
+            if self.results[i]:
+                c[self.results[i][0]] += 1
+        return c
+
+    def rows(self):
+        return [(name, col, pygame.Rect(40, 150 + k * 40, BOARD_PX - 40, 36)) for k, (name, col) in
+                enumerate(REVIEW_CATS)]
+
+    def click(self, pos):
+        if not self.BOX.collidepoint(pos):
+            return False
+        for name, _, r in self.rows():
+            if r.collidepoint(pos):
+                self.sel = None if self.sel == name else name
+        return True
+
+    def names(self):
+        g = self.game
+        if hasattr(g, "white"):
+            return g.white, g.black
+        if hasattr(g, "opp_name"):
+            me = my_name()[:12]
+            return (me, g.opp_name[:12]) if g.human == 1 else (g.opp_name[:12], me)
+        return ("You", "Bot") if g.human == 1 else ("Bot", "You")
+
+    def draw(self, s):
+        box = self.BOX
+        pygame.draw.rect(s, (24, 22, 20), box)
+        pygame.draw.rect(s, ACCENT, box, 2)
+        text(s, "Game Review", 40, (box.centerx, 52), TEXT, center=True)
+        n = len(self.moves)
+        if not self.finished:
+            w = int((box.w - 80) * self.done / max(1, n))
+            pygame.draw.rect(s, (60, 57, 54), (60, 84, box.w - 80, 10), border_radius=5)
+            pygame.draw.rect(s, ACCENT, (60, 84, w, 10), border_radius=5)
+            text(s, "Analyzing move %d of %d..." % (min(self.done + 1, n), n), 20, (box.centerx, 100), MUTED,
+                 center=True)
+        else:
+            text(s, "%d moves analyzed - click a row to see which moves" % n, 20, (box.centerx, 92), MUTED,
+                 center=True)
+        wn, bn = self.names()
+        text(s, "White: " + wn, 24, (box.x + 330, 122), TEXT, center=True)
+        text(s, "Black: " + bn, 24, (box.x + 560, 122), TEXT, center=True)
+        cw, cb = self.counts(0), self.counts(1)
+        for name, col, r in self.rows():
+            sel = self.sel == name
+            pygame.draw.rect(s, (52, 49, 46) if sel else (34, 32, 30), r, border_radius=6)
+            if sel:
+                pygame.draw.rect(s, col, r, 2, border_radius=6)
+            pygame.draw.circle(s, col, (r.x + 20, r.centery), 9)
+            text(s, name, 26, (r.x + 40, r.y + 8), TEXT)
+            text(s, str(cw[name]), 28, (box.x + 330, r.centery), col if cw[name] else MUTED, center=True)
+            text(s, str(cb[name]), 28, (box.x + 560, r.centery), col if cb[name] else MUTED, center=True)
+        y = 150 + len(REVIEW_CATS) * 40 + 14
+        if not self.sel:
+            text(s, "Brilliant: a good sacrifice   Great: the only good move   Miss: a winning chance let go", 18,
+                 (box.centerx, y + 6), MUTED, center=True)
+            return
+        col = REVIEW_COLOR[self.sel]
+        text(s, self.sel + " moves", 26, (40, y), col)
+        y += 30
+        for side, x in ((0, 40), (1, 40 + (box.w - 40) // 2)):
+            text(s, "White" if side == 0 else "Black", 22, (x, y), MUTED)
+            yy, shown = y + 24, 0
+            items = [(i, r) for i, r in enumerate(self.results) if r and r[0] == self.sel and i % 2 == side]
+            for i, (cat, loss, best_txt) in items:
+                if yy > box.bottom - 72:
+                    text(s, "+%d more" % (len(items) - shown), 18, (x, yy), MUTED)
+                    break
+                mv = self.texts[i] if i < len(self.texts) else "?"
+                line = "%d%s %s" % (i // 2 + 1, "." if side == 0 else "...", mv)
+                if cat not in ("Best", "Brilliant", "Great"):
+                    line += "  (best %s, -%.1f)" % (best_txt, loss / 100)
+                text(s, line[:40], 19, (x, yy), TEXT)
+                yy += 21
+                shown += 1
+            if not items:
+                text(s, "none", 19, (x, yy), MUTED)
+
+
 class PlanMixin:
     """Planning marks: right-click a square to highlight it, right-drag between squares to draw an arrow.
     Any left click clears them.  They are only on your screen."""
@@ -1381,6 +1618,8 @@ class Game2P(AnimMixin, ChoiceMixin, PlanMixin):
         self.ox = 20 + (BOARD_PX - self.cell * self.board.cols) // 2
         self.oy = 20 + (BOARD_PX - self.cell * self.board.rows) // 2
         self.dead = False
+        self.moves = []                    # every move played, for the game review
+        self.review, self.show_review = None, False
         self.title = {"normal": "Normal Chess", "blitz": "Blitz 3+2", "military": "Army Chess",
                       "army": "Military Chess", "fullarmy": "Full Military"}[variant]
 
@@ -1477,6 +1716,7 @@ class Game2P(AnimMixin, ChoiceMixin, PlanMixin):
     def play(self, m):
         b = self.board
         mover = b.turn
+        self.moves.append(m)
         f, t, fl = m
         p = b.sq[f]
         items, ghosts, shots, blasts, span = [], [], [], [], 1.0
@@ -1642,7 +1882,24 @@ class Game2P(AnimMixin, ChoiceMixin, PlanMixin):
         self.draw_panel(s)
         self.draw_choice(s)
         if self.result and not self.anim:
-            overlay(s, self.result, self.HINT)
+            if self.show_review and self.review:
+                self.review.draw(s)
+            else:
+                overlay(s, self.result, self.HINT)
+            for label, rect in self.review_buttons():
+                button(s, rect, label)
+
+    REVIEW_BTN = pygame.Rect(20 + BOARD_PX // 2 - 80, 20 + BOARD_PX // 2 + 66, 160, 42)
+
+    def review_buttons(self):
+        if not (self.result and not self.anim and self.moves):
+            return []
+        return [("Close review", GameReview.CLOSE)] if self.show_review else [("Review", self.REVIEW_BTN)]
+
+    def start_review(self):
+        """Begin analysing the finished game in the background (called as soon as it ends)."""
+        if self.review is None and self.result and self.moves:
+            self.review = GameReview(self)
 
     # panel text (overridden by the LAN game)
     HINT = "Restart for a rematch, or go back to the menu"
@@ -1665,7 +1922,7 @@ class Game2P(AnimMixin, ChoiceMixin, PlanMixin):
     def draw_panel(self, s):
         px = 760
         pygame.draw.rect(s, PANEL, (px - 10, 0, W - px + 10, H))
-        text(s, self.title, 34, (px, 22))
+        text(s, self.title, 34 if len(self.title) < 18 else 28 if len(self.title) < 22 else 24, (px, 22))
         text(s, self.subtitle(), 26, (px, 62), MUTED)
         opp, me = -self.human, self.human
         if self.blitz:
@@ -1695,10 +1952,16 @@ class Game2P(AnimMixin, ChoiceMixin, PlanMixin):
 
     def buttons(self):
         return [("Menu", pygame.Rect(760, 650, 100, 40)), ("Restart", pygame.Rect(870, 650, 100, 40)),
-                ("Flip board", pygame.Rect(760, 700, 100, 40)), ("Resign", pygame.Rect(870, 700, 100, 40))]
+                ("Flip board", pygame.Rect(760, 700, 100, 40)), ("Resign", pygame.Rect(870, 700, 100, 40))] + \
+            self.review_buttons()
 
     def press(self, label):
-        if label == "Flip board":
+        if label == "Review":
+            self.start_review()
+            self.show_review = True
+        elif label == "Close review":
+            self.show_review = False
+        elif label == "Flip board":
             self.flip = not self.flip
         elif label == "Resign":
             self.resign()
@@ -2824,6 +3087,9 @@ class NetGame2P(SpecHostMixin, ChatMixin, Game2P):
             if not self.result:
                 self.clock[-self.human] = 0
                 self.result = "%s ran out of time - %s wins!" % (self.color(-self.human), self.color(self.human))
+        elif t == "over":                  # a tournament match decided by the organizer
+            if not self.result:
+                self.result = str(msg.get("text") or "Match over")[:60]
         elif t == "rematch":
             self.rematch_them = True
         elif t == "chat":
@@ -2868,9 +3134,10 @@ class NetGame2P(SpecHostMixin, ChatMixin, Game2P):
     def buttons(self):
         if getattr(self, "tournament", False):
             return [("Menu", pygame.Rect(760, 650, 100, 40)), ("Flip board", pygame.Rect(760, 700, 100, 40)),
-                    ("Resign", pygame.Rect(870, 700, 100, 40))]
+                    ("Resign", pygame.Rect(870, 700, 100, 40))] + self.review_buttons()
         return [("Menu", pygame.Rect(760, 650, 100, 40)), ("Rematch", pygame.Rect(870, 650, 100, 40)),
-                ("Flip board", pygame.Rect(760, 700, 100, 40)), ("Resign", pygame.Rect(870, 700, 100, 40))]
+                ("Flip board", pygame.Rect(760, 700, 100, 40)), ("Resign", pygame.Rect(870, 700, 100, 40))] + \
+            self.review_buttons()
 
     def press(self, label):
         if label == "Rematch":
@@ -3240,7 +3507,8 @@ class SpecViewMixin:
             self.result = "Lost sync with the game"
 
     def buttons(self):
-        return [("Menu", pygame.Rect(760, 650, 100, 40))] + self.extra_buttons()
+        return [("Menu", pygame.Rect(760, 650, 100, 40))] + self.extra_buttons() + \
+            (self.review_buttons() if hasattr(self, "review_buttons") else [])
 
 
 class SpecGame2P(SpecViewMixin, ChatMixin, Game2P):
@@ -4036,7 +4304,7 @@ class Inbox:
 #   {"type": "g", "c": channel, "d": <normal LAN game message>}    {"type": "g_close", "c": channel}
 # Control messages: t_invite / t_accept / t_state / t_match / t_watch / t_watching / t_end.
 T_MAX_ROUNDS = 4
-T_SWITCH_DELAY = 4.0        # seconds between the last result of a round and the next round starting
+T_SWITCH_DELAY = 5.0        # seconds between the last result of a round and the next round starting
 
 
 def t_layout(variant, teams):
@@ -4273,6 +4541,8 @@ class Relay2P:
         self.winner = winner
         self.result = why if why.startswith("Draw") else "%s - %s wins" % (why, self.color(winner))
         self.spec_send({"type": "spec", "ev": ["end", self.result]})
+        for s in (1, -1):                  # the players' own boards may not know (move limit, a silent clock...)
+            self.forward(s, {"type": "over", "text": self.result})
         self.td.match_done(self.match, [self.players[winner].slot], self.result)
 
     def on_msg(self, s, msg):
@@ -4730,6 +5000,7 @@ class TournamentDirector:
                     self.note("Champion: " + " & ".join(self.players[s].label() for s in self.champions))
                 elif self.round_done_at is None:
                     self.round_done_at = time.time()
+                    self.dirty = True                         # tell everyone: the countdown has started
                 elif time.time() - self.round_done_at > T_SWITCH_DELAY:
                     self.start_round(self.cur_round + 1)
         if self.dirty:
@@ -4745,7 +5016,14 @@ class TournamentDirector:
                 "names": [p.label() for p in self.players],
                 "matches": [{"id": m.id, "round": m.round, "slots": m.slots, "status": m.status,
                              "winners": m.winners, "note": m.note} for m in self.matches],
-                "champions": self.champions, "phase": "done" if self.phase == "done" else "running"}
+                "champions": self.champions, "phase": "done" if self.phase == "done" else "running",
+                "next_in": self.next_in(), "next_round": self.cur_round + 1}
+
+    def next_in(self):
+        """Seconds until the next round starts, or None."""
+        if self.phase != "running" or self.round_done_at is None:
+            return None
+        return max(0.0, T_SWITCH_DELAY - (time.time() - self.round_done_at))
 
     def shutdown(self, reason="The organizer ended the tournament"):
         if self.phase == "inviting":
@@ -4873,6 +5151,7 @@ class TournamentClient:
         self.pending_spec = None
         self.ended = None
         self.chat = TournamentChat(lambda msg: self.conn.send({"type": "t_chat", "text": msg}))
+        self.next_at = None
 
     def watch(self, mid):
         if not self.ended:
@@ -4898,6 +5177,8 @@ class TournamentClient:
             t = msg.get("type")
             if t == "t_state" and isinstance(msg.get("state"), dict):
                 self.state = msg["state"]
+                nxt = self.state.get("next_in")
+                self.next_at = time.time() + nxt if isinstance(nxt, (int, float)) else None
             elif t == "t_match":
                 vp = VirtualPeer(self.conn, msg.get("c"))
                 self.routes[msg.get("c")] = vp
@@ -4998,6 +5279,20 @@ class TournamentView:
             return a.tclient.state, a.tclient.slot, None, False
         return None, None, None, False
 
+    def countdown(self):
+        """'Round 2 starts in 4' while the break between rounds runs, else None."""
+        a = self.app
+        if a.td and a.td.phase == "running":
+            n, rnd, rounds = a.td.next_in(), a.td.cur_round + 1, a.td.rounds
+        elif a.tclient and a.tclient.next_at and a.tclient.state and not a.tclient.ended:
+            n, rnd, rounds = a.tclient.next_at - time.time(), a.tclient.state.get("next_round", 0), \
+                a.tclient.state.get("rounds", 0)
+        else:
+            return None
+        if n is None or n <= 0:
+            return None
+        return "%s starts in %d" % ("Final" if rnd == rounds - 1 else "Round %d" % (rnd + 1), int(n) + 1)
+
     def chat(self):
         a = self.app
         if a.td and a.td.phase != "setup":
@@ -5084,8 +5379,9 @@ class TournamentView:
             title += " - " + dict(VARIANTS)[st["variant"]] + (" 2v2" if st["teams"] else "")
         text(s, title, 46, (40 + self.BRACKET_W // 2, 40), TEXT, center=True)
         ended = a.tclient.ended if (a.tclient and not director) else None
-        text(s, ended or self.my_status(st, me), 26, (40 + self.BRACKET_W // 2, 84), ERR if ended else ACCENT,
-             center=True)
+        cd = None if ended else self.countdown()
+        text(s, ended or cd or self.my_status(st, me), 26, (40 + self.BRACKET_W // 2, 84),
+             ERR if ended else (TEXT if cd else ACCENT), center=True)
         if st:
             colw = self.BRACKET_W // st["rounds"]
             for r in range(st["rounds"]):
@@ -5201,6 +5497,8 @@ class App:
             print("fullscreen unavailable:", exc)
 
     def start(self):
+        if self.game is not None:
+            self.game.dead = True              # stops a review still analysing the old game
         v = self.variant
         if is4(v):
             seat = random.randrange(4) if self.side4 == "random" else 0
@@ -5352,6 +5650,13 @@ class App:
     def game_click(self, pos):
         if hasattr(self.game, "chat_click") and self.game.chat_click(pos):
             return
+        for label, rect in getattr(self.game, "review_buttons", lambda: [])():     # drawn over the board
+            if rect.collidepoint(pos):
+                self.game.press(label)
+                return
+        rv = getattr(self.game, "review", None)
+        if rv and self.game.show_review and rv.click(pos):
+            return
         for label, rect in self.game.buttons():
             if rect.collidepoint(pos):
                 self.game.press(label)
@@ -5429,6 +5734,8 @@ class App:
                 self.tview.draw(self.screen)
             else:
                 self.game.update()
+                if hasattr(self.game, "start_review") and self.game.result:
+                    self.game.start_review()                    # analyse in the background while you look
                 if getattr(self.game, "next_game", None):       # LAN rematch / re-sync: swap in the new game
                     old, self.game = self.game, self.game.next_game
                     if hasattr(self.game, "adopt_spectators"):
@@ -5437,14 +5744,26 @@ class App:
                 self.game.draw(self.screen)
                 text(self.screen, "Enter = chat    F = fullscreen" if hasattr(self.game, "chat_key")
                      else "F = fullscreen", 18, (W - 12, 742), MUTED, right=True)
-            if self.state != "challenges":
-                self.inbox.draw_toast(self.screen)
-            tchat = self.tview.chat()
-            if tchat and tchat.away and self.state != "tournament":     # new tournament chat while you're away
-                text(self.screen, "Tournament chat: %d new - open the bracket to read" % tchat.away, 18, (22, 3),
-                     ACCENT)
+            self.draw_overlays()
             pygame.display.flip()
             self.clock.tick(60)
+
+    def draw_overlays(self):
+        """Notices drawn on top of every screen: challenge pop-ups, the next-round countdown, tournament chat."""
+        if self.state != "challenges":
+            self.inbox.draw_toast(self.screen)
+        cd = self.tview.countdown() if self.state == "game" else None
+        if cd:                                  # the next round is about to start: show it over the board
+            img = font(28).render(cd, True, TEXT)
+            toast = self.inbox.toast and time.time() < self.inbox.toast[1] and self.state != "challenges"
+            box = img.get_rect(midtop=(20 + BOARD_PX // 2, 62 if toast else 26)).inflate(28, 14)
+            pygame.draw.rect(self.screen, (24, 22, 20), box, border_radius=10)
+            pygame.draw.rect(self.screen, ACCENT, box, 2, border_radius=10)
+            self.screen.blit(img, img.get_rect(center=box.center))
+        tchat = self.tview.chat()
+        if tchat and tchat.away and self.state != "tournament":     # new tournament chat while you're away
+            text(self.screen, "Tournament chat: %d new - open the bracket to read" % tchat.away, 18, (22, 3),
+                 ACCENT)
 
 
 if __name__ == "__main__":
