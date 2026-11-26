@@ -2,7 +2,8 @@
 """
 Pygame Chess  -  Normal / Blitz / Military / 4 Player
 Bots from ~100 to ~1500 Elo.   Install:  pip3 install pygame-ce    Run:  python3 chess_game.py
-LAN play: challenge other players on the same network by IP address (all variants, TCP port 5555).
+LAN play: challenge other players on the same network by IP address (all variants, TCP port 5555),
+watch friends' games, and run single-elimination tournaments (Tournament button on the menu).
 """
 import sys
 import json
@@ -2079,7 +2080,7 @@ def overlay(s, msg, hint="Restart for a rematch, or go back to the menu"):
 # the host answers {"type": "accept", "name": ...} or {"type": "decline", "reason": ...}.
 # In game: {"type": "move", "m": [from, to, flag], "clock": secs}, "resign", "timeout", "rematch".
 NET_PORT = 5555
-NET_PROTO = 4
+NET_PROTO = 5
 PING_EVERY, PEER_TIMEOUT = 4.0, 20.0     # keep-alive: a silent connection is dropped instead of hanging
 LAN_VARIANTS = {"normal", "blitz", "military", "army", "fullarmy"}
 LAN4_VARIANTS = {"4p", "4pmil", "4parmy", "4pfull"}
@@ -2480,6 +2481,8 @@ class SpecHostMixin:
                     self.specs.remove(item)
                     self.chat_add(None, "%s stopped watching" % name, MUTED)
                     break
+            if item in self.specs and not peer.alive:
+                self.specs.remove(item)
         if self.result and not self.spec_result_sent:
             self.spec_result_sent = True
             self.spec_ev(["end", self.neutral_result()])
@@ -2640,6 +2643,9 @@ class NetGame2P(SpecHostMixin, ChatMixin, Game2P):
                 self.result = "%s ran out of time - %s wins!" % (self.color(turn), self.color(-turn))
 
     def buttons(self):
+        if getattr(self, "tournament", False):
+            return [("Menu", pygame.Rect(760, 650, 100, 40)), ("Flip board", pygame.Rect(760, 700, 100, 40)),
+                    ("Resign", pygame.Rect(870, 700, 100, 40))]
         return [("Menu", pygame.Rect(760, 650, 100, 40)), ("Rematch", pygame.Rect(870, 650, 100, 40)),
                 ("Flip board", pygame.Rect(760, 700, 100, 40)), ("Resign", pygame.Rect(870, 700, 100, 40))]
 
@@ -3605,8 +3611,10 @@ class Inbox:
                 self.remove(e, {"type": "decline", "reason": "busy"})
 
     def busy(self):
-        return self.app.state == "game" and isinstance(self.app.game, (NetGame2P, NetGame4P, SpecGame2P,
-                                                                       SpecGame4P))
+        a = self.app
+        if a.tclient or (a.td and a.td.phase != "setup"):
+            return True
+        return a.state == "game" and isinstance(a.game, (NetGame2P, NetGame4P, SpecGame2P, SpecGame4P))
 
     def spectate(self, e, msg):
         """Someone wants to watch the LAN game we are playing."""
@@ -3644,8 +3652,15 @@ class Inbox:
                 if e["msg"] is None:
                     if t == "spectate":
                         self.spectate(e, msg)
-                    elif t == "challenge" and (self.busy() or len(self.ready()) >= self.MAX):
+                    elif t in ("challenge", "t_invite") and (self.busy() or len(self.ready()) >= self.MAX):
                         self.remove(e, {"type": "decline", "reason": "busy"})
+                    elif t == "t_invite" and valid_tinvite(msg):
+                        e["msg"] = msg
+                        who = str(msg.get("name") or e["peer"].addr)[:20]
+                        self.toast = ("Tournament invite from %s - see Challenges" % who, time.time() + 6)
+                        self.unseen += 1
+                    elif t == "t_invite":
+                        self.remove(e, {"type": "decline", "reason": "different game version"})
                     elif t == "challenge" and valid_challenge(msg):
                         e["msg"] = msg
                         who = str(msg.get("name") or e["peer"].addr)[:20]
@@ -3655,7 +3670,7 @@ class Inbox:
                         self.remove(e, {"type": "decline", "reason": "different game version"})
                     elif t == "_closed":
                         self.remove(e)
-                elif t in ("_closed", "cancel"):
+                elif t in ("_closed", "cancel", "t_end"):
                     if e is self.joined:
                         self.toast = ("The host cancelled the 4 Player game", time.time() + 5)
                     self.remove(e)
@@ -3667,6 +3682,13 @@ class Inbox:
 
     def accept(self, e):
         m = e["msg"]
+        if m.get("type") == "t_invite":
+            e["peer"].send({"type": "t_accept", "name": self.name})
+            self.entries.remove(e)
+            self.decline_all()
+            self.app.tclient = TournamentClient(self.app, e["peer"], m)
+            self.app.state = "tournament"
+            return
         e["peer"].send({"type": "accept", "name": self.name})
         who = str(m.get("name") or e["peer"].addr)[:20]
         if is4(m["variant"]):
@@ -3735,7 +3757,8 @@ class Inbox:
             pygame.draw.rect(s, (24, 22, 20), r, border_radius=10)
             pygame.draw.rect(s, ACCENT if joined else (68, 64, 60), r, 2, border_radius=10)
             text(s, "%s  (%s)" % (str(m.get("name") or "Someone")[:20], e["peer"].addr), 28, (r.x + 16, r.y + 10))
-            text(s, describe_challenge(m), 22, (r.x + 16, r.y + 40), MUTED)
+            text(s, describe_tinvite(m) if m.get("type") == "t_invite" else describe_challenge(m), 22,
+                 (r.x + 16, r.y + 40), MUTED)
             if joined:
                 text(s, "Joined - waiting for the host...", 22, (acc.right - 6, acc.y + 12), ACCENT, right=True)
                 button(s, dec, "Leave")
@@ -3761,6 +3784,980 @@ class Inbox:
         pygame.draw.rect(s, (24, 22, 20), box, border_radius=10)
         pygame.draw.rect(s, ACCENT, box, 2, border_radius=10)
         s.blit(img, img.get_rect(center=box.center))
+
+
+# ----------------------------------------------------------------------------
+# Tournaments: single elimination, up to 4 rounds, run entirely on the organizer's computer
+# ----------------------------------------------------------------------------
+# Every player keeps ONE connection to the organizer.  Matches are played on the organizer's machine
+# (Relay2P for 2-player games, a screen-less NetGame4P hub for 4 Player), and each player's game or
+# spectator view talks to it through a numbered "channel" on that connection:
+#   {"type": "g", "c": channel, "d": <normal LAN game message>}    {"type": "g_close", "c": channel}
+# Control messages: t_invite / t_accept / t_state / t_match / t_watch / t_watching / t_end.
+T_MAX_ROUNDS = 4
+T_SWITCH_DELAY = 4.0        # seconds between the last result of a round and the next round starting
+
+
+def t_layout(variant, teams):
+    """(players per match, players who advance from each match, max rounds)."""
+    if not is4(variant):
+        return 2, 1, 4
+    if teams:
+        return 4, 2, 4                  # the winning pair moves on together
+    return 4, 1, 2                      # free-for-all: 3 rounds would need 64 players
+
+
+def t_round_sizes(variant, teams, rounds):
+    """Number of players in each round."""
+    k, adv, _ = t_layout(variant, teams)
+    sizes = [k]
+    for _ in range(rounds - 1):
+        sizes.insert(0, sizes[0] * k // adv)
+    return sizes
+
+
+def _copy(msg):
+    return json.loads(json.dumps(msg))
+
+
+class PipeEnd:
+    """In-process stand-in for a Peer (the organizer's own game talking to a match on the same computer)."""
+    addr = "this computer"
+
+    def __init__(self):
+        self.q, self.other, self.closed = deque(), None, False
+
+    @property
+    def alive(self):
+        return not self.closed
+
+    def send(self, msg):
+        if not self.closed and self.other and not self.other.closed:
+            self.other.q.append(_copy(msg))
+
+    def get(self):
+        return self.q.popleft() if self.q else None
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            if self.other and not self.other.closed:
+                self.other.closed = True
+                self.other.q.append({"type": "_closed"})
+
+
+def pipe_pair():
+    a, b = PipeEnd(), PipeEnd()
+    a.other, b.other = b, a
+    return a, b
+
+
+class VirtualPeer:
+    """One channel multiplexed over a real Peer connection; looks like a Peer to the games."""
+
+    def __init__(self, conn, cid):
+        self.conn, self.cid, self.addr = conn, cid, conn.addr
+        self.q, self.closed = deque(), False
+
+    @property
+    def alive(self):
+        return not self.closed and self.conn.alive
+
+    def send(self, msg):
+        if self.alive:
+            self.conn.send({"type": "g", "c": self.cid, "d": msg})
+
+    def get(self):
+        return self.q.popleft() if self.q else None
+
+    def feed(self, msg):
+        if msg.get("type") == "_closed":
+            if self.closed:
+                return
+            self.closed = True
+        self.q.append(msg)
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            if self.conn.alive:
+                self.conn.send({"type": "g_close", "c": self.cid})
+
+
+def route_channel_msg(routes, msg):
+    """Deliver a g / g_close message to its channel.  Returns True if it was one."""
+    t = msg.get("type")
+    if t == "g":
+        vp = routes.get(msg.get("c"))
+        if vp and isinstance(msg.get("d"), dict):
+            vp.feed(msg["d"])
+        return True
+    if t == "g_close":
+        vp = routes.get(msg.get("c"))
+        if vp:
+            vp.feed({"type": "_closed"})
+        return True
+    return False
+
+
+def build_client_game(glyphs, info, peer):
+    """The game screen for a tournament match (used by remote players and by the organizer)."""
+    if info["kind"] == 2:
+        g = NetGame2P(glyphs, info["variant"], int(info["side"]), peer, str(info.get("opp") or "?")[:20],
+                      back_to="tournament")
+    else:
+        g = NetGame4P(glyphs, info["variant"], bool(info.get("teams")), int(info.get("elo", 900)), int(info["seat"]),
+                      list(info["names"]), host=peer)
+        g.back_to = "tournament"
+    g.tournament = True
+    g.HINT = "Tournament match - Menu goes back to the bracket"
+    return g
+
+
+class Relay2P:
+    """A 2-player tournament match run by the organizer.  Humans connect to it exactly as they would to a LAN
+    opponent (it forwards each side's moves to the other); bot sides are played here."""
+    MAX_PLIES = 400
+    BOT_DELAY, BOT_DELAY_ALL_BOTS = 0.3, 0.75      # seconds; all-bot games are paced so spectators can follow
+
+    def __init__(self, td, match, white, black):
+        self.td, self.match, self.variant = td, match, td.v
+        self.board = Board({"military": "military", "army": "army", "fullarmy": "fullarmy"}.get(td.v, "normal"))
+        self.legal = self.board.legal()
+        self.players = {1: white, -1: black}
+        self.ends = {1: None, -1: None}
+        self.blitz = td.v == "blitz"
+        self.clock = {1: 180.0, -1: 180.0}
+        self.tick = time.time()
+        self.events, self.specs = [], []
+        self.result, self.winner, self.bot = None, None, None
+
+    def name(self, s):
+        return self.players[s].label()
+
+    def color(self, s):
+        return "White" if s == 1 else "Black"
+
+    def start(self):
+        for s in (1, -1):
+            if self.players[s].is_human():
+                self.ends[s] = self.td.join(self.players[s], {"kind": 2, "variant": self.variant, "side": s,
+                                                              "opp": self.name(-s)})
+
+    def forward(self, s, msg):
+        if self.ends[s]:
+            self.ends[s].send(msg)
+
+    # spectators
+    def spec_info(self):
+        return {"kind": 2, "variant": self.variant, "white": self.name(1), "black": self.name(-1),
+                "clock": {"1": round(self.clock[1], 2), "-1": round(self.clock[-1], 2)}}
+
+    def add_spectator(self, end, name):
+        end.send({"type": "spec_start", "info": self.spec_info(), "events": self.events, "result": self.result})
+        self.specs.append(end)
+
+    def spec_send(self, msg):
+        for e in self.specs:
+            e.send(msg)
+
+    def spec_pump(self):
+        for e in list(self.specs):
+            while True:
+                m = e.get()
+                if m is None or m.get("type") == "_closed":
+                    break
+            if not e.alive:
+                self.specs.remove(e)
+
+    # game
+    def apply(self, mv):
+        b = self.board
+        mover = b.turn
+        b.make(mv)
+        b.history.append(b.key())
+        self.legal = b.legal()
+        ev = ["m", list(mv), {"1": round(self.clock[1], 2), "-1": round(self.clock[-1], 2)}]
+        self.events.append(ev)
+        self.spec_send({"type": "spec", "ev": ev})
+        if not self.legal:
+            if b.in_check():
+                self.finish(mover, "Checkmate")
+            else:
+                self.draw("stalemate")
+        elif b.halfmove >= 100:
+            self.draw("50-move rule")
+        elif b.history.count(b.key()) >= 3:
+            self.draw("repetition")
+        elif not b.military and b.insufficient():
+            self.draw("insufficient material")
+        elif len(self.events) >= self.MAX_PLIES:              # very long game: decide on material
+            sc = b.evaluate()
+            if sc == 0:
+                self.draw("move limit")
+            else:
+                self.finish(1 if sc > 0 else -1, "On material")
+
+    def draw(self, why):
+        self.finish(-1, "Draw (%s) - Black advances" % why)
+
+    def finish(self, winner, why):
+        if self.result:
+            return
+        self.winner = winner
+        self.result = why if why.startswith("Draw") else "%s - %s wins" % (why, self.color(winner))
+        self.spec_send({"type": "spec", "ev": ["end", self.result]})
+        self.td.match_done(self.match, [self.players[winner].slot], self.result)
+
+    def on_msg(self, s, msg):
+        t = msg.get("type")
+        if t == "move":
+            if self.result or self.board.turn != s:
+                return
+            try:
+                mv = tuple(int(x) for x in msg["m"])
+            except (KeyError, TypeError, ValueError):
+                return
+            if not move_ok(mv, self.legal, PROMO_KIND, 4):
+                return
+            if isinstance(msg.get("clock"), (int, float)):
+                self.clock[s] = float(msg["clock"])
+            self.forward(-s, msg)
+            self.apply(mv)
+        elif t in ("resign", "timeout", "_closed"):
+            if not self.result:
+                self.forward(-s, {"type": "timeout" if t == "timeout" else "resign"})
+                self.finish(-s, "%s %s" % (self.color(s), {"resign": "resigned", "timeout": "ran out of time",
+                                                           "_closed": "left"}[t]))
+        elif t == "chat":
+            text_ = clean_chat(msg.get("text", ""))
+            if text_:
+                self.forward(-s, {"type": "chat", "text": text_})
+                self.spec_send({"type": "spec_chat", "who": self.name(s)[:12], "text": text_, "color": list(OPP_COLOR)})
+
+    def pump(self):
+        now = time.time()
+        dt, self.tick = now - self.tick, now
+        for s in (1, -1):
+            e = self.ends[s]
+            while e:
+                msg = e.get()
+                if msg is None:
+                    break
+                self.on_msg(s, msg)
+        self.spec_pump()
+        if self.result:
+            return
+        turn = self.board.turn
+        if self.blitz:
+            self.clock[turn] -= dt
+            if self.clock[turn] < -(NetGame2P.FLAG_GRACE + 1):      # that player's client never reported it
+                self.forward(-turn, {"type": "timeout"})
+                self.finish(-turn, "%s ran out of time" % self.color(turn))
+                return
+        if self.ends[turn] is not None or self.players[turn].is_human():
+            return                                            # waiting for a human
+        if self.bot is None:
+            b, elo = self.board.copy(), self.td.elo
+            both_bots = self.ends[-turn] is None
+            tl = min(LEVELS[elo][3], 0.4) if both_bots else LEVELS[elo][3]
+            job = {"done": False, "move": None, "t0": now, "delay": self.BOT_DELAY_ALL_BOTS if both_bots else self.BOT_DELAY}
+
+            def work():
+                try:
+                    job["move"] = choose_move(b, elo, tl)
+                except Exception:
+                    job["move"] = None
+                job["done"] = True
+            threading.Thread(target=work, daemon=True).start()
+            self.bot = job
+        elif self.bot["done"] and now - self.bot["t0"] > self.bot["delay"]:
+            mv, self.bot = self.bot["move"], None
+            if mv not in self.legal:
+                mv = random.choice(self.legal)
+            if self.blitz:
+                self.clock[turn] += 2
+            self.forward(-turn, {"type": "move", "m": list(mv), "clock": round(self.clock[turn], 2)})
+            self.apply(mv)
+
+
+def hub_winners(hub):
+    """Who advances from a finished 4 Player match (seats).  Ties are settled by a coin toss."""
+    b = hub.b
+    if hub.teams:
+        a, c = b.score[0] + b.score[2], b.score[1] + b.score[3]
+        out0, out1 = not (b.alive[0] or b.alive[2]), not (b.alive[1] or b.alive[3])
+        if out1 != out0:
+            t = 0 if out1 else 1
+        elif a != c:
+            t = 0 if a > c else 1
+        else:
+            t = random.choice((0, 1))
+        return [t, t + 2]
+    top = max(b.score)
+    return [random.choice([i for i in range(4) if b.score[i] == top])]
+
+
+class TPlayer:
+    def __init__(self, slot, kind, name, conn=None):
+        self.slot, self.kind, self.name, self.conn = slot, kind, name, conn    # kind: you | remote | bot
+        self.routes = {}                  # remote: channel id -> VirtualPeer
+        self.watch_end = None             # the spectator channel this player is using, if any
+        self.gone = False
+
+    def is_human(self):
+        return self.kind == "you" or (self.kind == "remote" and not self.gone)
+
+    def label(self):
+        if self.kind == "bot":
+            return self.name
+        return self.name + (" (left)" if self.gone else "")
+
+
+class TMatch:
+    def __init__(self, mid, rnd, slots):
+        self.id, self.round, self.slots = mid, rnd, slots
+        self.status, self.winners, self.note, self.server = "live", [], "", None
+        self.seat_slot = None             # 4 Player: seat -> bracket slot
+
+
+class TournamentDirector:
+    """The organizer's side: invites players, builds the bracket, runs every match, streams spectators."""
+    COLS, ROWS = 4, 8
+    SLOT_W, SLOT_H = 200, 34
+
+    def __init__(self, app):
+        self.app = app
+        self.phase = "setup"              # setup | inviting | running | done
+        self.rounds = 2
+        self.texts = [""] * 32
+        self.me_playing = True
+        self.focus = 1
+        self.status, self.status_color = "", MUTED
+        self.invites = {}                 # slot -> {"state", "peer", "name", "note"}
+        self.connect_q = queue.Queue()
+        self.players, self.matches = [], []
+        self.me = TPlayer(None, "you", my_name())
+        self.cid = 0
+        self.round_done_at = None
+        self.champions = None
+        self.cur_round = -1
+        self.dirty = False
+
+    # ---- setup -------------------------------------------------------------
+    def teams(self):
+        return self.app.teams and is4(self.app.variant)
+
+    def max_rounds(self):
+        return t_layout(self.app.variant, self.teams())[2]
+
+    def n_players(self):
+        self.rounds = max(1, min(self.rounds, self.max_rounds()))
+        return t_round_sizes(self.app.variant, self.teams(), self.rounds)[0]
+
+    def say(self, msg, color=MUTED):
+        self.status, self.status_color = msg, color
+
+    def slot_rect(self, i):
+        return pygame.Rect(80 + (i // self.ROWS) * 215, 220 + (i % self.ROWS) * 40, self.SLOT_W, self.SLOT_H)
+
+    ROUND_BTNS = [pygame.Rect(200 + n * 70, 128, 60, 36) for n in range(4)]
+    ME_BTN = pygame.Rect(520, 128, 190, 36)
+    SHUFFLE = pygame.Rect(730, 128, 170, 36)
+    INVITE = pygame.Rect(250, 560, 230, 50)
+    START = pygame.Rect(500, 560, 250, 50)
+    CANCEL = pygame.Rect(770, 560, 130, 50)
+    BACK = pygame.Rect(80, 680, 200, 50)
+
+    def begin_invites(self):
+        n = self.n_players()
+        self.v, self.tm, self.elo = self.app.variant, self.teams(), self.app.elo
+        self.invites = {}
+        for i in range(n):
+            if self.me_playing and i == 0:
+                continue
+            txt = self.texts[i].strip()
+            if not txt:
+                continue
+            try:
+                host, port = parse_address(txt)
+            except ValueError:
+                self.say("Slot %d: bad address '%s'" % (i + 1, txt), ERR)
+                return
+            self.invites[i] = {"state": "connecting", "peer": None, "name": "", "note": "Connecting..."}
+            threading.Thread(target=self._connect, args=(i, host, port), daemon=True).start()
+        self.phase = "inviting"
+        self.say("Sending invitations..." if self.invites else "No addresses - starting with bots only.")
+
+    def _connect(self, i, host, port):
+        try:
+            self.connect_q.put((i, True, socket.create_connection((host, port), timeout=5)))
+        except OSError as exc:
+            self.connect_q.put((i, False, exc))
+
+    def cancel_invites(self):
+        for inv in self.invites.values():
+            if inv["peer"]:
+                inv["peer"].send({"type": "t_end", "reason": "The organizer cancelled the tournament"})
+                inv["peer"].close()
+        self.invites = {}
+        self.phase = "setup"
+        self.say("Cancelled.")
+
+    def pending(self):
+        return any(inv["state"] in ("connecting", "waiting") for inv in self.invites.values())
+
+    def pump_invites(self):
+        while True:
+            try:
+                i, ok, res = self.connect_q.get_nowait()
+            except queue.Empty:
+                break
+            inv = self.invites.get(i)
+            if not inv or inv["state"] != "connecting":
+                if ok:
+                    res.close()
+                continue
+            if not ok:
+                inv["state"], inv["note"] = "failed", connect_error(res)[0]
+                continue
+            res.settimeout(None)
+            inv["peer"], inv["state"], inv["note"] = Peer(res, res.getpeername()), "waiting", "Waiting..."
+            inv["peer"].send({"type": "t_invite", "proto": NET_PROTO, "name": self.me.name, "variant": self.v,
+                              "teams": self.tm, "rounds": self.rounds, "slot": i, "players": self.n_players()})
+        for i, inv in self.invites.items():
+            p = inv["peer"]
+            while p and inv["state"] in ("waiting", "accepted"):
+                msg = p.get()
+                if msg is None:
+                    break
+                t = msg.get("type")
+                if t == "t_accept" and inv["state"] == "waiting":
+                    inv["state"], inv["name"] = "accepted", str(msg.get("name") or p.addr)[:16]
+                    inv["note"] = "Joined - " + inv["name"]
+                    p.send({"type": "t_state", "state": self.preview_state()})
+                elif t in ("decline", "_closed"):
+                    inv["state"], inv["note"] = "declined", "Left" if t == "_closed" else \
+                        ("Busy" if msg.get("reason") == "busy" else "Declined")
+                    p.close()
+                    inv["peer"] = None
+        if self.phase == "inviting" and not self.pending():
+            if all(inv["state"] == "accepted" for inv in self.invites.values()):
+                self.start()
+
+    def preview_state(self):
+        names = []
+        for i in range(self.n_players()):
+            inv = self.invites.get(i)
+            if self.me_playing and i == 0:
+                names.append(self.me.name)
+            elif inv and inv["state"] == "accepted":
+                names.append(inv["name"])
+            elif inv and inv["state"] in ("connecting", "waiting"):
+                names.append("(invited)")
+            else:
+                names.append("Bot %d" % (i + 1))
+        return {"variant": self.v, "teams": self.tm, "rounds": self.rounds, "names": names, "matches": [],
+                "champions": None, "phase": "waiting"}
+
+    # ---- running -----------------------------------------------------------
+    def start(self):
+        self.players = []
+        for i in range(self.n_players()):
+            inv = self.invites.get(i)
+            if self.me_playing and i == 0:
+                self.me.slot = 0
+                self.players.append(self.me)
+            elif inv and inv["state"] == "accepted" and inv["peer"] and inv["peer"].alive:
+                self.players.append(TPlayer(i, "remote", inv["name"], inv["peer"]))
+            else:
+                if inv and inv["peer"]:
+                    inv["peer"].close()
+                self.players.append(TPlayer(i, "bot", "Bot %d" % (i + 1)))
+        if not self.me_playing:
+            self.me.slot = None
+        self.invites = {}
+        self.phase = "running"
+        self.say("")
+        self.app.state = "tournament"         # (the organizer's own match, if any, takes over the screen)
+        self.start_round(0)
+
+    def remotes(self):
+        return [p for p in self.players if p.kind == "remote" and not p.gone]
+
+    def next_cid(self):
+        self.cid += 1
+        return self.cid
+
+    def stop_watch(self, p):
+        if p.watch_end:
+            p.watch_end.close()
+            p.watch_end = None
+
+    def join(self, p, info):
+        """Put player p into a match: returns the match server's end of their channel."""
+        self.stop_watch(p)
+        if p.kind == "you":
+            a, b = pipe_pair()
+            self.app.switch_game(build_client_game(self.app.glyphs, info, b))
+            return a
+        cid = self.next_cid()
+        vp = VirtualPeer(p.conn, cid)
+        p.routes[cid] = vp
+        msg = dict(info)
+        msg.update(type="t_match", c=cid)
+        p.conn.send(msg)
+        return vp
+
+    def watch(self, p, mid):
+        m = self.matches[mid] if isinstance(mid, int) and 0 <= mid < len(self.matches) else None
+        if not m or m.status != "live" or (p.slot is not None and p.slot in m.slots and p.is_human()):
+            return
+        self.stop_watch(p)
+        if p.kind == "you":
+            a, b = pipe_pair()
+            m.server.add_spectator(a, p.name)
+            g = make_spectator(self.app.glyphs, b.get(), b)
+            if g:
+                g.back_to = "tournament"
+                p.watch_end = a
+                self.app.switch_game(g)
+            return
+        cid = self.next_cid()
+        vp = VirtualPeer(p.conn, cid)
+        p.routes[cid] = vp
+        p.conn.send({"type": "t_watching", "c": cid})
+        m.server.add_spectator(vp, p.label())
+        p.watch_end = vp
+
+    def start_round(self, r):
+        k, adv, _ = t_layout(self.v, self.tm)
+        if r == 0:
+            entrants = list(range(len(self.players)))
+        else:
+            entrants = [s for m in self.matches if m.round == r - 1 for s in m.winners]
+        self.cur_round, self.round_done_at = r, None
+        for j in range(0, len(entrants), k):
+            m = TMatch(len(self.matches), r, entrants[j:j + k])
+            self.matches.append(m)
+            self.start_match(m)
+        self.dirty = True
+
+    def start_match(self, m):
+        ps = [self.players[s] for s in m.slots]
+        if len(ps) == 2:
+            if random.random() < 0.5:
+                ps.reverse()
+            m.server = Relay2P(self, m, ps[0], ps[1])
+            m.server.start()
+            return
+        if self.tm:                        # slots [a1, a2, b1, b2]: pair a = Red + Yellow, pair b = Blue + Green
+            pairs = [ps[:2], ps[2:]]
+            random.shuffle(pairs)
+            seats = [pairs[0][0], pairs[1][0], pairs[0][1], pairs[1][1]]
+        else:
+            seats = ps[:]
+            random.shuffle(seats)
+        m.seat_slot = [p.slot for p in seats]
+        names = [p.label() for p in seats]
+        peers = {}
+        hub = NetGame4P(self.app.glyphs, self.v, self.tm, self.elo, -1, names, peers=peers)
+        hub.tournament = True
+        m.server = hub
+        for seat, p in enumerate(seats):
+            if p.is_human():
+                peers[seat] = self.join(p, {"kind": 4, "variant": self.v, "teams": self.tm, "seat": seat,
+                                            "names": names, "elo": self.elo})
+
+    def match_done(self, m, winner_slots, note):
+        if m.status == "done":
+            return
+        m.status, m.winners, m.note = "done", winner_slots, note
+        self.dirty = True
+
+    def pump(self):
+        if self.phase in ("setup", "inviting"):
+            self.pump_invites()
+            return
+        for p in self.remotes():
+            while True:
+                msg = p.conn.get()
+                if msg is None:
+                    break
+                if route_channel_msg(p.routes, msg):
+                    continue
+                t = msg.get("type")
+                if t == "t_watch":
+                    self.watch(p, msg.get("match"))
+                elif t == "_closed":
+                    p.gone = True
+                    for vp in p.routes.values():
+                        vp.feed({"type": "_closed"})
+                    self.dirty = True
+                    break
+        for m in self.matches:
+            if m.server is None:
+                continue
+            if isinstance(m.server, Relay2P):
+                m.server.pump()
+            else:
+                m.server.update()
+                if m.server.result and m.status == "live":
+                    self.match_done(m, [m.seat_slot[s] for s in hub_winners(m.server)],
+                                    getattr(m.server, "result_neutral", None) or m.server.result)
+        if self.phase == "running":
+            live = [m for m in self.matches if m.round == self.cur_round and m.status == "live"]
+            if not live:
+                if self.cur_round == self.rounds - 1:
+                    final = [m for m in self.matches if m.round == self.cur_round]
+                    self.champions = [s for m in final for s in m.winners]
+                    self.phase = "done"
+                    self.dirty = True
+                elif self.round_done_at is None:
+                    self.round_done_at = time.time()
+                elif time.time() - self.round_done_at > T_SWITCH_DELAY:
+                    self.start_round(self.cur_round + 1)
+        if self.dirty:
+            self.dirty = False
+            st = self.state()
+            for p in self.remotes():
+                p.conn.send({"type": "t_state", "state": st})
+
+    def state(self):
+        if self.phase in ("setup", "inviting"):
+            return self.preview_state() if self.phase == "inviting" else None
+        return {"variant": self.v, "teams": self.tm, "rounds": self.rounds,
+                "names": [p.label() for p in self.players],
+                "matches": [{"id": m.id, "round": m.round, "slots": m.slots, "status": m.status,
+                             "winners": m.winners, "note": m.note} for m in self.matches],
+                "champions": self.champions, "phase": "done" if self.phase == "done" else "running"}
+
+    def shutdown(self, reason="The organizer ended the tournament"):
+        if self.phase == "inviting":
+            self.cancel_invites()
+        for p in self.players:
+            if p.kind == "remote" and not p.gone:
+                p.conn.send({"type": "t_end", "reason": reason})
+                p.conn.close()
+        for m in self.matches:
+            if isinstance(m.server, NetGame4P):
+                m.server.spec_close()
+        self.phase = "setup"
+
+    # ---- setup screen --------------------------------------------------------
+    def click(self, pos):
+        app = self.app
+        if self.BACK.collidepoint(pos):
+            app.state = "menu"
+            return
+        if self.phase == "inviting":
+            if self.CANCEL.collidepoint(pos):
+                self.cancel_invites()
+            elif self.START.collidepoint(pos) and not self.pending():
+                self.start()
+            return
+        for n, r in enumerate(self.ROUND_BTNS):
+            if r.collidepoint(pos) and n + 1 <= self.max_rounds():
+                self.rounds = n + 1
+        if self.ME_BTN.collidepoint(pos):
+            self.me_playing = not self.me_playing
+        if self.SHUFFLE.collidepoint(pos):
+            n = self.n_players()
+            start = 1 if self.me_playing else 0
+            part = self.texts[start:n]
+            random.shuffle(part)
+            self.texts[start:n] = part
+        for i in range(self.n_players()):
+            if self.slot_rect(i).collidepoint(pos) and not (self.me_playing and i == 0):
+                self.focus = i
+        if self.INVITE.collidepoint(pos):
+            self.begin_invites()
+
+    def key(self, e):
+        if self.phase != "setup":
+            return
+        n = self.n_players()
+        order = [i for i in range(n) if not (self.me_playing and i == 0)]
+        if self.focus not in order:
+            self.focus = order[0]
+        if e.key == pygame.K_TAB:
+            k = order.index(self.focus) + (-1 if e.mod & pygame.KMOD_SHIFT else 1)
+            self.focus = order[k % len(order)]
+        elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.begin_invites()
+        elif e.key == pygame.K_BACKSPACE:
+            self.texts[self.focus] = self.texts[self.focus][:-1]
+        elif e.unicode and e.unicode.isprintable() and not e.unicode.isspace() and len(self.texts[self.focus]) < 30:
+            self.texts[self.focus] += e.unicode
+
+    def draw(self, s):
+        s.fill(BG)
+        text(s, "TOURNAMENT", 64, (W // 2, 46), TEXT, center=True)
+        v = self.v if self.phase == "inviting" else self.app.variant
+        tm = self.tm if self.phase == "inviting" else self.teams()
+        label = dict(VARIANTS)[v] + (" - Teams 2v2" if tm else "")
+        rule = {2: "draws: Black advances", 4: "winning pair advances" if tm else "top score advances"}[
+            4 if is4(v) else 2]
+        text(s, "Game: %s   (bots Elo %d, %s)  - change in the main menu" % (label, self.app.elo, rule), 22,
+             (80, 92), MUTED)
+        n = self.n_players()
+        text(s, "Rounds", 26, (80, 136), TEXT)
+        setup = self.phase == "setup"
+        for k, r in enumerate(self.ROUND_BTNS):
+            button(s, r, str(k + 1), self.rounds == k + 1, enabled=setup and k + 1 <= self.max_rounds())
+        button(s, self.ME_BTN, "I'm playing" if self.me_playing else "Just organizing", self.me_playing, enabled=setup)
+        button(s, self.SHUFFLE, "Shuffle", enabled=setup)
+        k = t_layout(v, tm)[0]
+        text(s, "%d players - leave a box empty for a bot.  Boxes in the same color group play each other first%s."
+             % (n, " (pairs = teams)" if tm else ""), 20, (80, 188), MUTED)
+        for i in range(n):
+            r = self.slot_rect(i)
+            group = i // k
+            tint = PLAYER_COLORS[group % 4]
+            pygame.draw.rect(s, (24, 22, 20), r, border_radius=6)
+            inv = self.invites.get(i)
+            if inv:
+                edge = ACCENT if inv["state"] == "accepted" else ERR if inv["state"] in ("failed", "declined") \
+                    else MUTED
+            else:
+                edge = ACCENT if (setup and i == self.focus) else tuple(c // 2 for c in tint)
+            pygame.draw.rect(s, edge, r, 2, border_radius=6)
+            pygame.draw.rect(s, tint, (r.x - 6, r.y + 4, 3, r.h - 8))
+            if tm and i % 2 == 0:
+                pygame.draw.line(s, tint, (r.x - 6, r.y + 4), (r.x - 6, r.y + 2 * 40 - 10), 3)
+            if self.me_playing and i == 0:
+                text(s, "You (%s)" % self.me.name[:12], 20, (r.x + 8, r.y + 9), ACCENT)
+                continue
+            shown = inv["note"] if inv else self.texts[i]
+            caret = "|" if setup and i == self.focus and int(time.time() * 2) % 2 else ""
+            if shown or caret:
+                text(s, (shown + caret)[-24:], 20, (r.x + 8, r.y + 9), TEXT if not inv else edge)
+            else:
+                text(s, "%d: bot" % (i + 1), 20, (r.x + 8, r.y + 9), (100, 96, 90))
+        if setup:
+            button(s, self.INVITE, "Send invites & start")
+        else:
+            if not self.pending():
+                button(s, self.START, "Start (bots fill gaps)")
+            button(s, self.CANCEL, "Cancel")
+        if self.status:
+            text(s, self.status, 22, (W // 2, 630), self.status_color, center=True)
+        button(s, self.BACK, "Back")
+
+
+class TournamentClient:
+    """A player in someone else's tournament."""
+
+    def __init__(self, app, conn, invite):
+        self.app, self.conn = app, conn
+        self.slot = int(invite.get("slot", 0))
+        self.host_name = str(invite.get("name") or conn.addr)[:16]
+        self.state = None
+        self.routes = {}
+        self.pending_spec = None
+        self.ended = None
+
+    def watch(self, mid):
+        if not self.ended:
+            self.conn.send({"type": "t_watch", "match": mid})
+
+    def leave(self):
+        self.conn.close()
+        g = self.app.game
+        if self.app.state == "game" and getattr(g, "back_to", "") == "tournament":
+            g.dead = True
+            g.close()
+        self.app.tclient = None
+        self.app.state = "menu"
+
+    def pump(self):
+        while True:
+            msg = self.conn.get()
+            if msg is None:
+                break
+            if route_channel_msg(self.routes, msg):
+                continue
+            t = msg.get("type")
+            if t == "t_state" and isinstance(msg.get("state"), dict):
+                self.state = msg["state"]
+            elif t == "t_match":
+                vp = VirtualPeer(self.conn, msg.get("c"))
+                self.routes[msg.get("c")] = vp
+                self.pending_spec = None
+                try:
+                    self.app.switch_game(build_client_game(self.app.glyphs, msg, vp))
+                except (KeyError, TypeError, ValueError):
+                    vp.close()
+            elif t == "t_watching":
+                vp = VirtualPeer(self.conn, msg.get("c"))
+                self.routes[msg.get("c")] = vp
+                self.pending_spec = vp
+            elif t == "t_end":
+                self.ended = str(msg.get("reason") or "The tournament ended")[:80]
+            elif t == "_closed":
+                if not self.ended:
+                    self.ended = "Lost the connection to the organizer"
+                for vp in self.routes.values():
+                    vp.feed({"type": "_closed"})
+        vp = self.pending_spec
+        if vp and vp.q:
+            msg = vp.get()
+            self.pending_spec = None
+            if msg.get("type") == "spec_start":
+                g = make_spectator(self.app.glyphs, msg, vp)
+                if g:
+                    g.back_to = "tournament"
+                    self.app.switch_game(g)
+                    return
+            vp.close()
+
+
+def describe_tinvite(m):
+    v = m["variant"]
+    return "Tournament: %s%s - %d players, %d round%s" % (dict(VARIANTS)[v], " 2v2" if m.get("teams") else "",
+                                                         m.get("players", 0), m["rounds"],
+                                                         "s" if m["rounds"] > 1 else "")
+
+
+def valid_tinvite(m):
+    return m.get("proto") == NET_PROTO and (m.get("variant") in LAN_VARIANTS or m.get("variant") in LAN4_VARIANTS) \
+        and m.get("rounds") in (1, 2, 3, 4) and isinstance(m.get("slot"), int)
+
+
+class TournamentView:
+    """The bracket screen (organizer and players).  Click a LIVE match to watch it."""
+    BACK = pygame.Rect(80, 690, 200, 46)
+    END = pygame.Rect(300, 690, 230, 46)
+    TOP, BOTTOM = 150, 670
+
+    def __init__(self, app):
+        self.app = app
+
+    def source(self):
+        a = self.app
+        if a.td and a.td.phase != "setup":
+            return a.td.state(), a.td.me.slot, a.td.me.name, True
+        if a.tclient:
+            return a.tclient.state, a.tclient.slot, None, False
+        return None, None, None, False
+
+    def boxes(self, st):
+        """(match id or None, rect, slots or None) for every bracket position."""
+        sizes = t_round_sizes(st["variant"], st["teams"], st["rounds"])
+        k = t_layout(st["variant"], st["teams"])[0]
+        colw = (W - 80) // st["rounds"]
+        out = []
+        for r, size in enumerate(sizes):
+            count = size // k
+            ms = [m for m in st["matches"] if m["round"] == r]
+            span = (self.BOTTOM - self.TOP) / count
+            rh = min(18, int((span - 24) / k))
+            h = rh * k + 8 + max(12, rh - 2)          # names + the result line
+            for i in range(count):
+                y = self.TOP + span * i + (span - h) / 2
+                rect = pygame.Rect(40 + r * colw + 6, int(y), colw - 24, h)
+                m = ms[i] if i < len(ms) else None
+                out.append((m, rect, rh))
+        return out
+
+    def my_status(self, st, me):
+        if st is None:
+            return "Waiting for the organizer..."
+        if st.get("champions"):
+            names = " & ".join(st["names"][s] for s in st["champions"])
+            if me is not None and me in st["champions"]:
+                return "You won the tournament!"
+            return "Champion: " + names
+        if st.get("phase") == "waiting":
+            return "Waiting for the organizer to start..."
+        if me is None:
+            return "Organizing - click a LIVE match to watch it"
+        mine = [m for m in st["matches"] if me in m["slots"]]
+        if mine and mine[-1]["status"] == "live":
+            return "Your match is being played"
+        if mine and me not in mine[-1]["winners"]:
+            return "You're out - click a LIVE match to watch"
+        return "You advance! Waiting for the next round - click a LIVE match to watch"
+
+    def click(self, pos):
+        a = self.app
+        st, me, _, director = self.source()
+        if self.BACK.collidepoint(pos):
+            a.state = "menu"
+            return
+        if self.END.collidepoint(pos):
+            if director:
+                a.td.shutdown()
+                a.td = None
+            elif a.tclient:
+                a.tclient.leave()
+            a.state = "menu"
+            return
+        if not st:
+            return
+        for m, rect, _ in self.boxes(st):
+            if m and m["status"] == "live" and rect.collidepoint(pos):
+                if director:
+                    a.td.watch(a.td.me, m["id"])
+                elif a.tclient:
+                    a.tclient.watch(m["id"])
+
+    def draw(self, s):
+        s.fill(BG)
+        a = self.app
+        st, me, _, director = self.source()
+        title = "TOURNAMENT"
+        if st:
+            title += " - " + dict(VARIANTS)[st["variant"]] + (" 2v2" if st["teams"] else "")
+        text(s, title, 46, (W // 2, 40), TEXT, center=True)
+        ended = a.tclient.ended if (a.tclient and not director) else None
+        text(s, ended or self.my_status(st, me), 28, (W // 2, 84), ERR if ended else ACCENT, center=True)
+        if st:
+            colw = (W - 80) // st["rounds"]
+            for r in range(st["rounds"]):
+                name = "Final" if r == st["rounds"] - 1 else "Semifinals" if r == st["rounds"] - 2 \
+                    else "Round %d" % (r + 1)
+                text(s, name, 22, (40 + r * colw + colw // 2 - 9, 122), MUTED, center=True)
+            mouse = pygame.mouse.get_pos()
+            boxes = self.boxes(st)
+            k, adv, _ = t_layout(st["variant"], st["teams"])
+            feed = k // adv                            # matches that feed one match of the next round
+            sizes = t_round_sizes(st["variant"], st["teams"], st["rounds"])
+            starts = [sum(sz // k for sz in sizes[:r]) for r in range(len(sizes))]
+            for r in range(len(sizes) - 1):            # bracket lines
+                for i in range(sizes[r] // k):
+                    a_ = boxes[starts[r] + i][1]
+                    b_ = boxes[starts[r + 1] + i // feed][1]
+                    xm = (a_.right + b_.x) // 2
+                    pygame.draw.lines(s, (78, 74, 70), False, [a_.midright, (xm, a_.centery), (xm, b_.centery),
+                                                               b_.midleft], 2)
+            for m, rect, rh in boxes:
+                live = m and m["status"] == "live"
+                hover = live and rect.collidepoint(mouse)
+                pygame.draw.rect(s, (44, 42, 39) if hover else (28, 26, 24), rect, border_radius=6)
+                pygame.draw.rect(s, ACCENT if live else (68, 64, 60), rect, 2, border_radius=6)
+                if not m:
+                    text(s, "TBD", max(14, rh), (rect.x + 8, rect.y + 4), (100, 96, 90))
+                    continue
+                for j, slot in enumerate(m["slots"]):
+                    nm = st["names"][slot][:18]
+                    won = slot in m["winners"]
+                    col = ACCENT if won else (MUTED if m["status"] == "done" else TEXT)
+                    if slot == me:
+                        nm = "> " + nm
+                    text(s, nm, max(14, rh), (rect.x + 8, rect.y + 4 + j * rh), col)
+                if st["teams"] and len(m["slots"]) == 4:      # pairs are teams
+                    yy = rect.y + 4 + 2 * rh - 1
+                    pygame.draw.line(s, (68, 64, 60), (rect.x + 6, yy), (rect.right - 6, yy), 1)
+                note = m["note"] if m["status"] == "done" else ("LIVE - click to watch" if hover else "")
+                if note:
+                    text(s, note[:int(rect.w / 6.5)], max(12, rh - 3), (rect.x + 8, rect.y + 5 + len(m["slots"]) * rh),
+                         ACCENT if live else MUTED)
+                if live:
+                    text(s, "LIVE", max(13, rh - 2), (rect.right - 6, rect.y + 4), ACCENT, right=True)
+        button(s, self.BACK, "Menu")
+        button(s, self.END, ("End tournament" if director else "Leave tournament") if not
+               (st and st.get("champions")) else "Close tournament")
 
 
 # ----------------------------------------------------------------------------
@@ -3803,6 +4800,9 @@ class App:
         self.game = None
         self.lobby = Lobby(self)
         self.inbox = Inbox(self)
+        self.td = None                     # tournament we organize
+        self.tclient = None                # tournament we joined
+        self.tview = TournamentView(self)
         self.inbox.open()                  # challenges can arrive at any time
         pygame.key.set_repeat(400, 35)     # hold a key to repeat it (text boxes)
 
@@ -3835,6 +4835,25 @@ class App:
     def open_lobby(self):
         self.inbox.open()
         self.state = "lan"
+
+    TOURN_RECT = pygame.Rect(80, 672, 190, 46)
+
+    def open_tournament(self):
+        if self.tclient:
+            self.state = "tournament"
+        else:
+            if self.td is None:
+                self.td = TournamentDirector(self)
+            self.state = "tsetup" if self.td.phase in ("setup", "inviting") else "tournament"
+
+    def switch_game(self, game):
+        """Replace whatever is on screen with a new game (tournament matches / spectating)."""
+        if self.state == "game" and self.game is not None and self.game is not game:
+            old = self.game
+            old.dead = True
+            if hasattr(old, "close"):
+                old.close()
+        self.begin_net_game(game)
 
     def begin_net_game(self, game):
         if self.game:
@@ -3896,6 +4915,8 @@ class App:
              (W // 2, 640), MUTED, center=True)
         button(s, pygame.Rect(W // 2 - 110, 665, 220, 60), "START GAME")
         button(s, self.LAN_RECT, "LAN Play")
+        live = self.tclient or (self.td and self.td.phase != "setup")
+        button(s, self.TOURN_RECT, "Tournament (live)" if live else "Tournament", bool(live))
         self.inbox.draw_button(s, self.INBOX_RECT)
 
     def menu_click(self, pos):
@@ -3907,6 +4928,9 @@ class App:
             return
         if self.INBOX_RECT.collidepoint(pos):
             self.state = "challenges"
+            return
+        if self.TOURN_RECT.collidepoint(pos):
+            self.open_tournament()
             return
         for kind, val, label, rect in self.menu_layout():
             if rect.collidepoint(pos):
@@ -3959,16 +4983,19 @@ class App:
                             self.lobby.cancel("")
                             self.lobby.stop_watch()
                             self.state = "menu"
-                        elif self.state == "challenges":
+                        elif self.state in ("challenges", "tournament", "tsetup"):
                             self.state = "menu"
                     elif self.state == "lan":
                         self.lobby.key(e)
+                    elif self.state == "tsetup":
+                        self.td.key(e)
                 if e.type == pygame.MOUSEBUTTONDOWN:
                     if e.button == 1:
                         if self.state == "game":
                             self.game.plan_clear()          # a left click wipes the planning arrows / marks
                         {"menu": self.menu_click, "lan": self.lobby.click, "challenges": self.inbox.click,
-                         "game": self.game_click}[self.state](e.pos)
+                         "game": self.game_click, "tournament": self.tview.click,
+                         "tsetup": lambda pos: self.td.click(pos)}[self.state](e.pos)
                     elif e.button == 3 and self.state == "game":
                         self.game.cancel()
                         self.game.plan_down(e.pos)
@@ -3976,12 +5003,20 @@ class App:
                     self.game.plan_up(e.pos)
             self.lobby.pump()
             self.inbox.pump()
+            if self.td:
+                self.td.pump()
+            if self.tclient:
+                self.tclient.pump()
             if self.state == "menu":
                 self.draw_menu()
             elif self.state == "lan":
                 self.lobby.draw(self.screen)
             elif self.state == "challenges":
                 self.inbox.draw(self.screen)
+            elif self.state == "tsetup":
+                self.td.draw(self.screen)
+            elif self.state == "tournament":
+                self.tview.draw(self.screen)
             else:
                 self.game.update()
                 if getattr(self.game, "next_game", None):       # LAN rematch / re-sync: swap in the new game
