@@ -6,9 +6,18 @@ LAN play: challenge other players on the same network by IP address (all variant
 watch friends' games, and run single-elimination tournaments (Tournament button on the menu).
 """
 import sys
+import os
+import re
 import json
 import queue
 import socket
+import atexit
+import ipaddress
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 import time
 import random
 import threading
@@ -2112,7 +2121,8 @@ def connect_error(exc):
     if isinstance(exc, ConnectionRefusedError):
         return "Not running", "the game isn't open there, or it couldn't open port %d" % NET_PORT
     if isinstance(exc, (socket.timeout, TimeoutError)):
-        return "No answer", "wrong address, a different network, or a firewall blocking port %d" % NET_PORT
+        return "No answer", ("wrong address, or they're on another network without 'Other networks' on, "
+                             "or a firewall is blocking port %d" % NET_PORT)
     if isinstance(exc, socket.gaierror):
         return "Bad address", "that address doesn't exist"
     return "Unreachable", str(getattr(exc, "strerror", None) or exc)
@@ -2138,6 +2148,218 @@ def parse_address(s):
         host, port = s.split(":")
         return host.strip(), int(port)
     return s, NET_PORT
+
+
+# ----------------------------------------------------------------------------
+# Other networks: accept players from outside the local network, open the port on the router (UPnP)
+# ----------------------------------------------------------------------------
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chess_settings.json")
+CGNAT = ipaddress.ip_network("100.64.0.0/10")        # shared ISP space; also used by Tailscale
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(**changes):
+    d = load_settings()
+    d.update(changes)
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+    except OSError:
+        pass
+
+
+def is_local_address(ip):
+    """True for addresses on this computer / the local network (and Tailscale-style VPN addresses)."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if getattr(a, "ipv4_mapped", None):
+        a = a.ipv4_mapped
+    return a.is_private or a.is_loopback or a.is_link_local or (a.version == 4 and a in CGNAT)
+
+
+class UPnPError(Exception):
+    pass
+
+
+UPNP_SERVICES = ("urn:schemas-upnp-org:service:WANIPConnection:2", "urn:schemas-upnp-org:service:WANIPConnection:1",
+                 "urn:schemas-upnp-org:service:WANPPPConnection:1")
+_NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))      # the router is always local
+
+
+def upnp_find(timeout=3.0, target=("239.255.255.250", 1900)):
+    """Ask the local network for an internet gateway (the router).  Returns (control URL, service type)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        s.settimeout(0.5)
+        for st in ("urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+                   "urn:schemas-upnp-org:device:InternetGatewayDevice:2") + UPNP_SERVICES[1:2]:
+            msg = ('M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 2\r\n'
+                   'ST: %s\r\n\r\n' % st).encode()
+            s.sendto(msg, target)
+        locations, deadline = [], time.time() + timeout
+        while time.time() < deadline:
+            try:
+                data, _ = s.recvfrom(4096)
+            except socket.timeout:
+                if locations:
+                    break
+                continue
+            for line in data.decode("latin-1").split("\r\n"):
+                if line.lower().startswith("location:"):
+                    loc = line.split(":", 1)[1].strip()
+                    if loc not in locations:
+                        locations.append(loc)
+    except OSError as exc:
+        raise UPnPError("network error (%s)" % (exc.strerror or exc))
+    finally:
+        s.close()
+    if not locations:
+        raise UPnPError("no router answered - UPnP may be switched off on it")
+    for loc in locations:
+        try:
+            return upnp_control(loc)
+        except (UPnPError, OSError, ValueError, ET.ParseError):
+            continue
+    raise UPnPError("the router doesn't offer port forwarding over UPnP")
+
+
+def upnp_control(location):
+    with _NO_PROXY.open(location, timeout=3) as r:
+        root = ET.fromstring(r.read())
+    base = location
+    for el in root.iter():
+        if el.tag.endswith("URLBase") and el.text:
+            base = el.text.strip()
+    for el in root.iter():
+        if not el.tag.endswith("service"):
+            continue
+        fields = {child.tag.split("}")[-1]: (child.text or "").strip() for child in el}
+        if fields.get("serviceType") in UPNP_SERVICES and fields.get("controlURL"):
+            return urllib.parse.urljoin(base, fields["controlURL"]), fields["serviceType"]
+    raise UPnPError("no port-forwarding service")
+
+
+def upnp_call(control, service, action, **args):
+    body = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:%s xmlns:u="%s">%s</u:%s>'
+            '</s:Body></s:Envelope>' % (action, service, "".join("<%s>%s</%s>" % (k, xml_escape(str(v)), k)
+                                                                 for k, v in args.items()), action))
+    req = urllib.request.Request(control, data=body.encode(), method="POST", headers={
+        "Content-Type": 'text/xml; charset="utf-8"', "SOAPAction": '"%s#%s"' % (service, action)})
+    try:
+        with _NO_PROXY.open(req, timeout=4) as r:
+            data = r.read()
+    except urllib.error.HTTPError as exc:
+        text_ = exc.read().decode("utf-8", "replace")
+        code = re.search(r"<errorCode>(\d+)</errorCode>", text_)
+        desc = re.search(r"<errorDescription>([^<]*)</errorDescription>", text_)
+        raise UPnPError("%s%s" % ("error %s" % code.group(1) if code else "HTTP %d" % exc.code,
+                                  " - " + desc.group(1) if desc else ""))
+    except (urllib.error.URLError, OSError) as exc:
+        raise UPnPError("the router didn't respond (%s)" % getattr(exc, "reason", exc))
+    out = {}
+    for el in ET.fromstring(data).iter():
+        tag = el.tag.split("}")[-1]
+        if tag.startswith("New"):
+            out[tag] = (el.text or "").strip()
+    return out
+
+
+def upnp_open_port(control, service, port, client):
+    for lease in (0, 86400):                     # some routers refuse permanent (0) mappings
+        try:
+            upnp_call(control, service, "AddPortMapping", NewRemoteHost="", NewExternalPort=port, NewProtocol="TCP",
+                      NewInternalPort=port, NewInternalClient=client, NewEnabled=1,
+                      NewPortMappingDescription="Pygame Chess", NewLeaseDuration=lease)
+            return
+        except UPnPError as exc:
+            if "718" in str(exc):
+                raise UPnPError("port %d is already forwarded to another computer" % port)
+            last = exc
+    raise last
+
+
+class Internet:
+    """The 'Other networks' option.  Off: only computers on the local network (or a VPN like Tailscale) can
+    connect to this game.  On: anyone who knows your public address can, and the router is asked to forward
+    the game's port to this computer."""
+
+    def __init__(self):
+        self.enabled = bool(load_settings().get("other_networks", False))
+        self.status, self.status_ok, self.public_ip = "", True, None
+        self.mapping = None                      # (control URL, service type) while the router forwards the port
+        self.lock = threading.Lock()
+        if self.enabled:
+            self.start()
+
+    def allows(self, ip):
+        return self.enabled or is_local_address(ip)
+
+    def set(self, on):
+        if on == self.enabled:
+            return
+        self.enabled = on
+        save_settings(other_networks=on)
+        if on:
+            self.start()
+        else:
+            self.status, self.public_ip = "", None
+            threading.Thread(target=self.close, daemon=True).start()
+
+    def start(self):
+        self.status, self.status_ok = "Asking your router to open port %d..." % NET_PORT, True
+        threading.Thread(target=self._open, daemon=True).start()
+
+    def _open(self):
+        me = local_ip()
+        try:
+            control, service = upnp_find()
+            try:
+                ext = upnp_call(control, service, "GetExternalIPAddress").get("NewExternalIPAddress") or None
+            except UPnPError:
+                ext = None
+            upnp_open_port(control, service, NET_PORT, me)
+        except UPnPError as exc:
+            if self.enabled:
+                self.status, self.status_ok = ("Router didn't open the port (%s). Forward TCP port %d to %s "
+                                               "on your router, or use a VPN like Tailscale." % (exc, NET_PORT, me),
+                                               False)
+            return
+        with self.lock:
+            self.mapping = (control, service)
+        if not self.enabled:                     # switched off while we were asking
+            self.close()
+            return
+        self.public_ip = ext
+        if ext and is_local_address(ext):
+            self.status, self.status_ok = ("Port opened, but your internet provider shares one address between "
+                                           "customers, so others can't reach you directly. Use a VPN like "
+                                           "Tailscale, or let a friend host.", False)
+        else:
+            self.status, self.status_ok = ("Friends on other networks: use %s:%d" % (ext, NET_PORT) if ext else
+                                           "Port %d opened on your router." % NET_PORT), True
+
+    def close(self):
+        """Remove the router's port forwarding (switching off, or quitting)."""
+        with self.lock:
+            m, self.mapping = self.mapping, None
+        if m:
+            try:
+                upnp_call(m[0], m[1], "DeletePortMapping", NewRemoteHost="", NewExternalPort=NET_PORT,
+                          NewProtocol="TCP")
+            except UPnPError:
+                pass
 
 
 class Peer:
@@ -3199,6 +3421,7 @@ class Lobby:
     BACK = pygame.Rect(80, 680, 200, 50)
     INBOX = pygame.Rect(300, 680, 240, 50)
     WATCH_INPUT = pygame.Rect(250, 584, 380, 44)
+    NETS_BTN = pygame.Rect(W - 80 - 250, 102, 250, 40)
     WATCH_BTN = pygame.Rect(650, 584, 190, 44)
 
     def __init__(self, app):
@@ -3270,7 +3493,7 @@ class Lobby:
 
     def _connect(self, i, host, port):
         try:
-            self.connect_q.put((i, True, socket.create_connection((host, port), timeout=5), (host, port)))
+            self.connect_q.put((i, True, socket.create_connection((host, port), timeout=8), (host, port)))
         except OSError as exc:
             self.connect_q.put((i, False, exc, (host, port)))
 
@@ -3449,6 +3672,9 @@ class Lobby:
         if self.INBOX.collidepoint(pos):
             self.app.state = "challenges"
             return
+        if self.NETS_BTN.collidepoint(pos):
+            self.app.internet.set(not self.app.internet.enabled)
+            return
         if self.WATCH_INPUT.collidepoint(pos):
             self.focus = "w"
             return
@@ -3499,8 +3725,12 @@ class Lobby:
             text(s, inbox.listen_error, 24, (80, 112), ERR)
         else:
             text(s, "Your address:  %s   (port %d)" % (inbox.myip, NET_PORT), 30, (80, 112), ACCENT)
-            if inbox.other_ips:
-                text(s, "also: " + ", ".join(inbox.other_ips), 20, (W - 80, 118), MUTED, right=True)
+        net = self.app.internet
+        button(s, self.NETS_BTN, "Other networks: " + ("ON" if net.enabled else "OFF"), net.enabled)
+        if net.enabled and net.status:
+            text(s, net.status[:118], 18, (80, 140), ACCENT if net.status_ok else ERR)
+        elif inbox.other_ips and not inbox.listen_error:
+            text(s, "also: " + ", ".join(inbox.other_ips), 19, (80, 140), MUTED)
         v = self.c_variant if self.active else self.app.variant
         if is4(v):
             teams = self.c_teams if self.active else self.app.teams
@@ -3558,8 +3788,8 @@ class Lobby:
         else:
             text(s, "a player's address", 30, (r.x + 12, r.y + 11), (100, 96, 90))
         button(s, self.WATCH_BTN, "Stop" if w.state else "Watch")
-        text(s, "Same game + same network for everyone. If nobody can reach you, allow Python / TCP port %d "
-             "through your firewall." % NET_PORT, 19, (W // 2, 646), MUTED, center=True)
+        text(s, "Everyone needs this game, on the same network (or turn on Other networks). If nobody can reach "
+             "you, allow Python / TCP port %d through your firewall." % NET_PORT, 18, (W // 2, 646), MUTED, center=True)
         button(s, self.BACK, "Back")
         inbox.draw_button(s, self.INBOX)
 
@@ -3638,7 +3868,14 @@ class Inbox:
                 got = self.listener.get()
                 if got is None:
                     break
-                p = Peer(*got)
+                sock, addr = got
+                if not self.app.internet.allows(addr[0]):     # "Other networks" is off: local network only
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    continue
+                p = Peer(sock, addr)
                 if len(self.entries) >= self.MAX + 4:
                     p.send({"type": "decline", "reason": "busy"})
                     p.close()
@@ -3744,7 +3981,10 @@ class Inbox:
             text(s, self.listen_error, 24, (80, 112), ERR)
         else:
             text(s, "Others can challenge you at  %s   (port %d)" % (self.myip, NET_PORT), 28, (80, 112), ACCENT)
-            if self.other_ips:
+            net = self.app.internet
+            if net.enabled and net.status:
+                text(s, net.status[:118], 18, (80, 140), ACCENT if net.status_ok else ERR)
+            elif self.other_ips:
                 text(s, "If that doesn't work, try: " + ", ".join(self.other_ips), 20, (80, 140), MUTED)
         self.unseen = 0
         rows = self.rows()
@@ -4192,7 +4432,7 @@ class TournamentDirector:
 
     def _connect(self, i, host, port):
         try:
-            self.connect_q.put((i, True, socket.create_connection((host, port), timeout=5)))
+            self.connect_q.put((i, True, socket.create_connection((host, port), timeout=8)))
         except OSError as exc:
             self.connect_q.put((i, False, exc))
 
@@ -4815,6 +5055,8 @@ class App:
         self.side4 = "red"                 # 4 Player color: "red" or "random"
         self.teams = False
         self.game = None
+        self.internet = Internet()         # "Other networks" option (remembered between runs)
+        atexit.register(self.internet.close)
         self.lobby = Lobby(self)
         self.inbox = Inbox(self)
         self.td = None                     # tournament we organize
@@ -5002,6 +5244,7 @@ class App:
         while True:
             for e in pygame.event.get():
                 if e.type == pygame.QUIT:
+                    self.internet.close()          # stop forwarding the port on the router
                     pygame.quit()
                     sys.exit()
                 if e.type == pygame.KEYDOWN and self.state == "game" and hasattr(self.game, "chat_key") \
