@@ -3,11 +3,12 @@
 Pygame Chess launcher
 ---------------------
 Checks the latest chess.py on GitHub (adventure-car/pygame-chess), updates your local copy if it changed,
-then starts the game.  Uses only the Python standard library.
+then starts the game.  It also keeps itself up to date (chess_launcher.py in the same repo).
+Uses only the Python standard library.
 
-    python3 launcher.py                         # opens the launcher window
-    python3 launcher.py --path C:/Games/chess.py --cli          # no window: update, then play
-    python3 launcher.py --path ~/chess.py --cli --no-launch     # just update
+    python3 chess_launcher.py                         # opens the launcher window
+    python3 chess_launcher.py --path C:/Games/chess.py --cli    # no window: update, then play
+    python3 chess_launcher.py --path ~/chess.py --cli --no-launch   # just update
 
 The chess.py path you choose is remembered in launcher_settings.json next to this file.
 A copy of your previous chess.py is kept as chess.py.bak whenever an update is installed.
@@ -17,6 +18,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -25,9 +27,13 @@ import time
 import urllib.error
 import urllib.request
 
+LAUNCHER_VERSION = 2       # bump this whenever chess_launcher.py changes, so copies only ever move forward
 REPO = "adventure-car/pygame-chess"
 BRANCH = "main"
 RAW_URL = "https://raw.githubusercontent.com/%s/%s/chess.py" % (REPO, BRANCH)
+LAUNCHER_URL = "https://raw.githubusercontent.com/%s/%s/chess_launcher.py" % (REPO, BRANCH)
+LAUNCHER_MARKER = b"Pygame Chess launcher"   # a real launcher always contains this
+SELF = os.path.abspath(__file__)
 SETTINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "launcher_settings.json")
 MIN_SIZE = 10_000          # anything smaller than this can't be the real game (e.g. an error page)
 
@@ -54,7 +60,7 @@ def save_path(path):
 def normalize(path):
     """Accept a file path or a folder (then chess.py inside it is used)."""
     path = os.path.abspath(os.path.expanduser(path.strip().strip('"')))
-    if os.path.isdir(path):
+    if os.path.isdir(path) or not path.lower().endswith(".py"):     # a folder (new or existing)
         path = os.path.join(path, "chess.py")
     return path
 
@@ -62,22 +68,28 @@ def normalize(path):
 # ----------------------------------------------------------------------------
 # Update logic
 # ----------------------------------------------------------------------------
-def download_latest(timeout=15):
-    """Fetch the newest chess.py from GitHub.  Raises an exception with a readable message on failure."""
-    url = "%s?nocache=%d" % (RAW_URL, int(time.time()))          # dodge stale CDN copies
+class NotOnGitHub(RuntimeError):
+    pass
+
+
+def download_latest(url=RAW_URL, min_size=MIN_SIZE, name="chess.py", timeout=15):
+    """Fetch the newest copy of a file from GitHub.  Raises an exception with a readable message on failure."""
+    url = "%s?nocache=%d" % (url, int(time.time()))              # dodge stale CDN copies
     req = urllib.request.Request(url, headers={"User-Agent": "pygame-chess-launcher",
                                                "Cache-Control": "no-cache"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             data = r.read()
     except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise NotOnGitHub("%s isn't on GitHub" % name)
         raise RuntimeError("GitHub answered %d %s" % (exc.code, exc.reason))
     except (urllib.error.URLError, OSError) as exc:
         raise RuntimeError("no connection to GitHub (%s)" % getattr(exc, "reason", exc))
-    if len(data) < MIN_SIZE:
-        raise RuntimeError("the downloaded file is too small to be the game")
+    if len(data) < min_size:
+        raise RuntimeError("the downloaded %s is too small to be real" % name)
     try:
-        compile(data, "chess.py", "exec")                            # never install a broken file
+        compile(data, name, "exec")                                  # never install a broken file
     except SyntaxError as exc:
         raise RuntimeError("the downloaded file has a syntax error (line %s)" % exc.lineno)
     return data
@@ -85,6 +97,58 @@ def download_latest(timeout=15):
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def same_text(a, b):
+    """Equal apart from Windows/Unix line endings."""
+    return sha(a.replace(b"\r\n", b"\n")) == sha(b.replace(b"\r\n", b"\n"))
+
+
+def write_atomic(path, data, backup):
+    folder = os.path.dirname(path) or "."
+    os.makedirs(folder, exist_ok=True)
+    if backup is not None:
+        with open(path + ".bak", "wb") as f:
+            f.write(backup)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".upd_", suffix=".tmp")
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)                      # atomic: the old file stays intact if anything fails
+
+
+def self_update(log=print):
+    """Replace this launcher with the newest one on GitHub.  Returns True if it was replaced."""
+    try:
+        new = download_latest(LAUNCHER_URL, 2000, "chess_launcher.py", timeout=8)
+    except NotOnGitHub:
+        return False                           # the repo doesn't ship a launcher (yet): nothing to do
+    except RuntimeError as exc:
+        log("Couldn't check for a launcher update: %s." % exc)
+        return False
+    if LAUNCHER_MARKER not in new:
+        log("Ignored a launcher update that doesn't look like this launcher.")
+        return False
+    found = re.search(rb"^LAUNCHER_VERSION\s*=\s*(\d+)", new, re.M)
+    if not found or int(found.group(1)) <= LAUNCHER_VERSION:
+        return False                           # same or older than this one: never downgrade
+    with open(SELF, "rb") as f:
+        mine = f.read()
+    try:
+        write_atomic(SELF, new, mine)
+    except OSError as exc:
+        log("Couldn't update the launcher: %s" % (exc.strerror or exc))
+        return False
+    log("The launcher updated itself (old copy saved as %s.bak)" % os.path.basename(SELF) + ". Restarting it...")
+    return True
+
+
+def restart_self(argv):
+    """Run the freshly updated launcher with the same options (and never self-update twice in a row)."""
+    cmd = [sys.executable, SELF] + [a for a in argv if a != "--no-self-update"] + ["--no-self-update",
+                                                                                 "--launcher-updated"]
+    if os.name == "nt":
+        sys.exit(subprocess.call(cmd))
+    os.execv(sys.executable, cmd)
 
 
 def update(path, log=print):
@@ -103,19 +167,11 @@ def update(path, log=print):
         log("Couldn't download the game: %s." % exc)
         return False
     # Line endings can differ on Windows (git autocrlf) - don't count that as a change.
-    if have is not None and sha(have.replace(b"\r\n", b"\n")) == sha(new.replace(b"\r\n", b"\n")):
+    if have is not None and same_text(have, new):
         log("You already have the latest version.")
         return True
-    folder = os.path.dirname(path) or "."
     try:
-        os.makedirs(folder, exist_ok=True)
-        if have is not None:
-            with open(path + ".bak", "wb") as f:
-                f.write(have)
-        fd, tmp = tempfile.mkstemp(dir=folder, prefix=".chess_", suffix=".tmp")
-        with os.fdopen(fd, "wb") as f:
-            f.write(new)
-        os.replace(tmp, path)                  # atomic: the old file stays intact if anything fails
+        write_atomic(path, new, have)
     except OSError as exc:
         log("Couldn't write %s: %s" % (path, exc.strerror or exc))
         return have is not None
@@ -179,7 +235,7 @@ def run_cli(path, no_launch):
 # ----------------------------------------------------------------------------
 # Window
 # ----------------------------------------------------------------------------
-def run_gui(initial):
+def run_gui(initial, notes=()):
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
@@ -260,6 +316,8 @@ def run_gui(initial):
     for b in buttons:
         b.pack(side="left", padx=8)
     log("Source: github.com/%s (%s branch)" % (REPO, BRANCH))
+    for n in notes:
+        log(n)
     entry.focus_set()
     root.bind("<Return>", lambda e: start(True))
     root.mainloop()
@@ -270,14 +328,21 @@ def main():
     ap.add_argument("--path", help="your chess.py (or the folder to put it in); remembered for next time")
     ap.add_argument("--cli", action="store_true", help="no window, use the terminal")
     ap.add_argument("--no-launch", action="store_true", help="only update, don't start the game")
+    ap.add_argument("--no-self-update", action="store_true", help="don't check for a newer launcher")
+    ap.add_argument("--launcher-updated", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if not args.no_self_update and self_update():
+        restart_self(sys.argv[1:])
+    notes = ["The launcher updated itself to the latest version."] if args.launcher_updated else []
     path = args.path or load_path()
     if not args.cli:
         try:
-            run_gui(normalize(path) if path else "")
+            run_gui(normalize(path) if path else "", notes)
             return 0
         except Exception as exc:                      # no tkinter / no display: fall back to the terminal
             print("(No launcher window available: %s - using the terminal.)" % exc)
+    for n in notes:
+        print(n)
     return run_cli(path, args.no_launch)
 
 
