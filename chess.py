@@ -4427,8 +4427,8 @@ class Relay2P:
     """A 2-player tournament match run by the organizer.  Humans connect to it exactly as they would to a LAN
     opponent (it forwards each side's moves to the other); bot sides are played here."""
     MAX_PLIES = 400
-    MAX_REPLAYS = 3                        # stalemates replayed (colors swapped) before a coin toss decides
-    REPLAY_DELAY = 3.0                     # seconds to show the stalemate before the replay starts
+    MAX_REPLAYS = 3                        # drawn games replayed (colors swapped) before a coin toss decides
+    REPLAY_DELAY = 3.0                     # seconds to show the draw before the replay starts
     BOT_DELAY, BOT_DELAY_ALL_BOTS = 0.3, 0.75      # seconds; all-bot games are paced so spectators can follow
 
     def __init__(self, td, match, white, black):
@@ -4496,7 +4496,7 @@ class Relay2P:
             if b.in_check():
                 self.finish(mover, "Checkmate")
             else:
-                self.stalemate()
+                self.draw("stalemate")
         elif b.halfmove >= 100:
             self.draw("50-move rule")
         elif b.history.count(b.key()) >= 3:
@@ -4511,21 +4511,21 @@ class Relay2P:
                 self.finish(1 if sc > 0 else -1, "On material")
 
     def draw(self, why):
-        self.finish(-1, "Draw (%s) - Black advances" % why)
-
-    def stalemate(self):
-        """A stalemate is replayed with colors swapped instead of handing Black the match."""
+        """Any draw (stalemate, repetition, 50-move rule, insufficient material, even at the move limit) is
+        replayed with colors swapped, so nobody goes through on a draw; a coin toss after MAX_REPLAYS."""
         if self.replays >= self.MAX_REPLAYS:
-            self.finish(random.choice((1, -1)), "Stalemate %d times, coin toss" % (self.replays + 1))
+            self.finish(random.choice((1, -1)), "Drawn %d times, coin toss" % (self.replays + 1))
             return
-        self.result = "Stalemate - replaying with colors swapped"
+        self.result = "Draw (%s) - replaying with colors swapped" % why
         self.replay_at = time.time() + self.REPLAY_DELAY
         self.spec_send({"type": "spec", "ev": ["end", self.result]})
-        self.td.replay_pending(self.match, "%s vs %s: stalemate - replaying with colors swapped" %
-                               (self.name(1), self.name(-1)))
+        for s in (1, -1):                  # e.g. the move limit: the players' boards can't tell on their own
+            self.forward(s, {"type": "over", "text": self.result})
+        self.td.replay_pending(self.match, "%s vs %s: draw (%s) - replaying with colors swapped" %
+                               (self.name(1), self.name(-1), why))
 
     def replay(self):
-        """The rematch after a stalemate: same match, colors swapped; watchers follow along."""
+        """The rematch after a draw: same match, colors swapped; watchers follow along."""
         new = Relay2P(self.td, self.match, self.players[-1], self.players[1])
         new.replays = self.replays + 1
         new.start()
@@ -4539,7 +4539,7 @@ class Relay2P:
         if self.result:
             return
         self.winner = winner
-        self.result = why if why.startswith("Draw") else "%s - %s wins" % (why, self.color(winner))
+        self.result = "%s - %s wins" % (why, self.color(winner))
         self.spec_send({"type": "spec", "ev": ["end", self.result]})
         for s in (1, -1):                  # the players' own boards may not know (move limit, a silent clock...)
             self.forward(s, {"type": "over", "text": self.result})
@@ -4938,7 +4938,7 @@ class TournamentDirector:
                                             "names": names, "elo": self.elo})
 
     def replay_pending(self, m, msg):
-        m.note = "Stalemate - replaying"
+        m.note = "Draw - replaying"
         self.dirty = True
         self.note(msg)
 
@@ -4981,7 +4981,7 @@ class TournamentDirector:
                 if m.server.replay_at and time.time() >= m.server.replay_at and m.status == "live":
                     m.server.replay_at = None
                     m.server = m.server.replay()
-                    m.note = "Replay %d (after stalemate)" % m.server.replays
+                    m.note = "Replay %d (after a draw)" % m.server.replays
                     self.dirty = True
                 m.server.pump()
             else:
@@ -5089,7 +5089,7 @@ class TournamentDirector:
         v = self.v if self.phase == "inviting" else self.app.variant
         tm = self.tm if self.phase == "inviting" else self.teams()
         label = dict(VARIANTS)[v] + (" - Teams 2v2" if tm else "")
-        rule = {2: "stalemate: replay, other draws: Black advances",
+        rule = {2: "draws are replayed",
                 4: "winning pair advances" if tm else "top score advances"}[
             4 if is4(v) else 2]
         text(s, "Game: %s  (bots Elo %d; %s) - set in the main menu" % (label, self.app.elo, rule), 20,
